@@ -1,0 +1,456 @@
+#!/bin/sh
+
+HELPER_NAME="byedpi-luci"
+DATA_DIR="/usr/share/byedpi-luci"
+STRATEGIES_FILE="$DATA_DIR/strategies.txt"
+DOMAINS_FILE="$DATA_DIR/domains.txt"
+RESULTS_FILE="$DATA_DIR/proxytest.results"
+LOCK_DIR="/tmp/byedpi-luci-test.lock"
+
+. /usr/share/libubox/jshn.sh
+
+clean_lines() {
+	local file="$1"
+	[ -f "$file" ] || return 0
+	sed -e 's/#.*$//' -e 's,//.*$,,' "$file" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v '^$'
+}
+
+json_status() {
+	local running=0 pid="" command="" enabled=0 current="" tmp_command part
+
+	current="$(uci -q get byedpi.main.cmd_opts || true)"
+	[ -n "$current" ] || current="$(uci -q get byedpi.main.options || true)"
+	/etc/init.d/byedpi enabled >/dev/null 2>&1 && enabled=1
+
+	if ubus call service list '{"name":"byedpi"}' >/tmp/byedpi-luci-service.json 2>/dev/null; then
+		running="$(jsonfilter -i /tmp/byedpi-luci-service.json -e '@.byedpi.instances.instance1.running' 2>/dev/null || echo 0)"
+		pid="$(jsonfilter -i /tmp/byedpi-luci-service.json -e '@.byedpi.instances.instance1.pid' 2>/dev/null || true)"
+		command="$(jsonfilter -i /tmp/byedpi-luci-service.json -e '@.byedpi.instances.instance1.command' 2>/dev/null || true)"
+	fi
+
+	[ "$running" = "true" ] && running=1
+
+	tmp_command="$(mktemp)"
+	if [ -n "$command" ]; then
+		echo "$command" | jsonfilter -e '@[*]' > "$tmp_command" 2>/dev/null || true
+	fi
+
+	json_init
+	json_add_boolean running "$running"
+	json_add_boolean enabled "$enabled"
+	json_add_string pid "$pid"
+	json_add_string current_strategy "$current"
+	json_add_array command
+	while IFS= read -r part; do
+		json_add_string "" "$part"
+	done < "$tmp_command"
+	json_close_array
+	json_dump
+
+	rm -f "$tmp_command"
+}
+
+score_for_strategy() {
+	local strategy="$1"
+	[ -f "$RESULTS_FILE" ] || return 0
+	grep -F -e "$strategy|" "$RESULTS_FILE" | head -n 1 | sed 's/^.*|//'
+}
+
+list_strategies() {
+	local index=0 line score tmp_strategies
+
+	tmp_strategies="$(mktemp)"
+	clean_lines "$STRATEGIES_FILE" > "$tmp_strategies"
+
+	json_init
+	json_add_array strategies
+	while IFS= read -r line; do
+		index=$((index + 1))
+		score="$(score_for_strategy "$line")"
+		json_add_object
+		json_add_int id "$index"
+		json_add_string value "$line"
+		json_add_string score "$score"
+		json_close_object
+	done < "$tmp_strategies"
+	json_close_array
+	json_dump
+
+	rm -f "$tmp_strategies"
+}
+
+add_check() {
+	local name="$1" ok="$2" detail="$3"
+
+	json_add_object
+	json_add_string name "$name"
+	json_add_boolean ok "$ok"
+	json_add_string detail "$detail"
+	json_close_object
+}
+
+diagnostics() {
+	local detail ok port_line proxy_detail podkop_proxy podkop_resolve current
+
+	current="$(uci -q get byedpi.main.cmd_opts || true)"
+	[ -n "$current" ] || current="$(uci -q get byedpi.main.options || true)"
+
+	json_init
+	json_add_string current_strategy "$current"
+	json_add_array checks
+
+	if [ -x /usr/bin/ciadpi ]; then
+		detail="$(/usr/bin/ciadpi --help 2>&1 | head -n 1)"
+		add_check "ciadpi" 1 "${detail:-/usr/bin/ciadpi найден}"
+	else
+		add_check "ciadpi" 0 "/usr/bin/ciadpi не найден или не исполняемый"
+	fi
+
+	if [ -x /etc/init.d/byedpi ]; then
+		add_check "init-скрипт" 1 "/etc/init.d/byedpi"
+	else
+		add_check "init-скрипт" 0 "/etc/init.d/byedpi не найден"
+	fi
+
+	if uci -q get byedpi.main >/dev/null; then
+		add_check "UCI config" 1 "/etc/config/byedpi, секция main"
+	else
+		add_check "UCI config" 0 "Нет секции byedpi.main"
+	fi
+
+	if /etc/init.d/byedpi enabled >/dev/null 2>&1; then
+		add_check "Автозапуск" 1 "enabled"
+	else
+		add_check "Автозапуск" 0 "disabled"
+	fi
+
+	if /etc/init.d/byedpi status >/dev/null 2>&1; then
+		add_check "Сервис" 1 "running"
+	else
+		add_check "Сервис" 0 "not running"
+	fi
+
+	port_line="$(netstat -tulnp 2>/dev/null | grep ':1080 ' | head -n 1)"
+	if [ -n "$port_line" ]; then
+		add_check "SOCKS 127.0.0.1:1080" 1 "$port_line"
+	else
+		add_check "SOCKS 127.0.0.1:1080" 0 "Порт 1080 не слушается"
+	fi
+
+	if curl --socks5-hostname 127.0.0.1:1080 --connect-timeout 3 -m 8 -L -k -o /dev/null https://ya.ru >/tmp/byedpi-luci-curl.log 2>&1; then
+		add_check "Проверка через SOCKS" 1 "https://ya.ru доступен через 127.0.0.1:1080"
+	else
+		proxy_detail="$(tail -n 1 /tmp/byedpi-luci-curl.log 2>/dev/null)"
+		add_check "Проверка через SOCKS" 0 "${proxy_detail:-curl завершился с ошибкой}"
+	fi
+
+	podkop_proxy="$(uci -q get podkop.byedpi.proxy_string || true)"
+	podkop_resolve="$(uci -q get podkop.byedpi.resolve_real_ip_for_routing || true)"
+	if [ "$podkop_proxy" = "socks5://127.0.0.1:1080#byedpi" ]; then
+		add_check "Podkop секция byedpi" 1 "$podkop_proxy"
+	else
+		add_check "Podkop секция byedpi" 0 "${podkop_proxy:-секция не найдена}"
+	fi
+
+	if [ "$podkop_resolve" = "1" ]; then
+		add_check "Podkop resolve real IP" 1 "enabled"
+	else
+		add_check "Podkop resolve real IP" 0 "disabled"
+	fi
+
+	json_close_array
+	json_dump
+}
+
+service_action() {
+	local action="$1"
+
+	case "$action" in
+		start|stop|restart)
+			/etc/init.d/byedpi "$action" >/dev/null 2>&1 || true
+			;;
+		*)
+			echo "Unsupported service action" >&2
+			return 1
+			;;
+	esac
+
+	json_status
+}
+
+apply_strategy() {
+	local strategy="$1" enabled="$2"
+
+	[ -n "$strategy" ] || {
+		echo "Strategy is empty" >&2
+		return 1
+	}
+
+	[ "$enabled" = "0" ] || enabled="1"
+
+	uci set byedpi.main.enabled="$enabled"
+	uci set byedpi.main.cmd_opts="$strategy"
+	uci set byedpi.main.options="$strategy"
+	uci commit byedpi
+
+	if [ "$enabled" = "1" ]; then
+		/etc/init.d/byedpi enable >/dev/null 2>&1 || true
+		/etc/init.d/byedpi restart >/dev/null 2>&1 || true
+	else
+		/etc/init.d/byedpi disable >/dev/null 2>&1 || true
+		/etc/init.d/byedpi stop >/dev/null 2>&1 || true
+	fi
+
+	json_status
+}
+
+test_domain() {
+	local domain="$1" requests="$2" success=0 total=0 url
+
+	case "$domain" in
+		http://*|https://*) url="$domain" ;;
+		*) url="https://$domain" ;;
+	esac
+
+	while [ "$total" -lt "$requests" ]; do
+		[ -f "$LOCK_DIR/stop" ] && break
+		total=$((total + 1))
+		if curl --socks5-hostname 127.0.0.1:1080 --connect-timeout 3 -m 8 -L -k -o /dev/null "$url" >/dev/null 2>&1; then
+			success=$((success + 1))
+		fi
+	done
+
+	echo "$domain|$success|$total"
+}
+
+restore_strategy() {
+	local original="$1" original_present="$2" was_running="$3"
+
+	if [ "$original_present" = "1" ]; then
+		uci set byedpi.main.cmd_opts="$original"
+		uci set byedpi.main.options="$original"
+	else
+		uci -q delete byedpi.main.cmd_opts || true
+		uci -q delete byedpi.main.options || true
+	fi
+
+	uci commit byedpi
+
+	if [ "$was_running" = "1" ]; then
+		/etc/init.d/byedpi restart >/dev/null 2>&1 || true
+	else
+		/etc/init.d/byedpi stop >/dev/null 2>&1 || true
+	fi
+}
+
+remove_lock_dir() {
+	[ -d "$LOCK_DIR" ] || return 0
+
+	rm -f \
+		"$LOCK_DIR/pid" \
+		"$LOCK_DIR/original" \
+		"$LOCK_DIR/original_present" \
+		"$LOCK_DIR/was_running" \
+		"$LOCK_DIR/stop"
+	rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+
+restore_from_lock() {
+	local original original_present was_running
+
+	[ -d "$LOCK_DIR" ] || return 0
+	[ -f "$LOCK_DIR/original_present" ] || return 0
+
+	original="$(cat "$LOCK_DIR/original" 2>/dev/null || true)"
+	original_present="$(cat "$LOCK_DIR/original_present" 2>/dev/null || echo 0)"
+	was_running="$(cat "$LOCK_DIR/was_running" 2>/dev/null || echo 0)"
+
+	[ "$original_present" = "1" ] || original_present=0
+	[ "$was_running" = "1" ] || was_running=0
+
+	restore_strategy "$original" "$original_present" "$was_running"
+}
+
+cleanup_test() {
+	trap - EXIT INT TERM
+	restore_from_lock
+	[ -n "${TEST_TMP_DOMAINS:-}" ] && rm -f "$TEST_TMP_DOMAINS"
+	[ -n "${TEST_TMP_RESULTS:-}" ] && rm -f "$TEST_TMP_RESULTS"
+	remove_lock_dir
+}
+
+pid_is_running() {
+	local pid="$1"
+	[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+clear_stale_lock() {
+	local pid
+
+	[ -d "$LOCK_DIR" ] || return 0
+	pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+	pid_is_running "$pid" && return 0
+
+	restore_from_lock
+	remove_lock_dir
+}
+
+stop_requested() {
+	[ -f "$LOCK_DIR/stop" ]
+}
+
+stop_test() {
+	local pid
+
+	if [ ! -d "$LOCK_DIR" ]; then
+		json_init
+		json_add_boolean stopping 0
+		json_add_boolean stopped 1
+		json_add_string message "No strategy test is running"
+		json_dump
+		return 0
+	fi
+
+	pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+	if pid_is_running "$pid"; then
+		: > "$LOCK_DIR/stop"
+		json_init
+		json_add_boolean stopping 1
+		json_add_boolean stopped 0
+		json_add_string message "Strategy test stop requested"
+		json_dump
+		return 0
+	fi
+
+	restore_from_lock
+	remove_lock_dir
+
+	json_init
+	json_add_boolean stopping 0
+	json_add_boolean stopped 1
+	json_add_string message "Stale strategy test lock removed"
+	json_dump
+}
+
+test_strategy() {
+	local strategy="$1" limit="$2" requests="$3" original original_present=0 was_running=0
+	local tested=0 success=0 total=0 stopped=0 domain_result domain_success domain_total
+
+	[ -n "$strategy" ] || {
+		echo "Strategy is empty" >&2
+		return 1
+	}
+
+	case "$limit" in
+		''|*[!0-9]*) limit=8 ;;
+	esac
+	case "$requests" in
+		''|*[!0-9]*) requests=1 ;;
+	esac
+
+	[ "$limit" -lt 1 ] && limit=1
+	[ "$limit" -gt 32 ] && limit=32
+	[ "$requests" -lt 1 ] && requests=1
+	[ "$requests" -gt 5 ] && requests=5
+
+	clear_stale_lock
+
+	if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+		echo "Strategy test is already running" >&2
+		return 1
+	fi
+
+	TEST_TMP_DOMAINS="$(mktemp)"
+	TEST_TMP_RESULTS="$(mktemp)"
+
+	uci -q get byedpi.main.cmd_opts >/dev/null 2>&1 && original_present=1
+	uci -q get byedpi.main.options >/dev/null 2>&1 && original_present=1
+	original="$(uci -q get byedpi.main.cmd_opts || true)"
+	[ -n "$original" ] || original="$(uci -q get byedpi.main.options || true)"
+	/etc/init.d/byedpi status >/dev/null 2>&1 && was_running=1
+
+	echo "$$" > "$LOCK_DIR/pid"
+	printf '%s\n' "$original" > "$LOCK_DIR/original"
+	echo "$original_present" > "$LOCK_DIR/original_present"
+	echo "$was_running" > "$LOCK_DIR/was_running"
+
+	trap 'cleanup_test' EXIT
+	trap 'cleanup_test; exit 130' INT
+	trap 'cleanup_test; exit 143' TERM
+
+	clean_lines "$DOMAINS_FILE" > "$TEST_TMP_DOMAINS"
+
+	uci set byedpi.main.enabled="1"
+	uci set byedpi.main.cmd_opts="$strategy"
+	uci set byedpi.main.options="$strategy"
+	uci commit byedpi
+	/etc/init.d/byedpi restart >/dev/null 2>&1 || true
+	sleep 2
+
+	while IFS= read -r domain; do
+		if stop_requested; then
+			stopped=1
+			break
+		fi
+
+		[ "$tested" -ge "$limit" ] && break
+		tested=$((tested + 1))
+		domain_result="$(test_domain "$domain" "$requests")"
+		echo "$domain_result" >> "$TEST_TMP_RESULTS"
+		domain_success="$(echo "$domain_result" | awk -F'|' '{print $2}')"
+		domain_total="$(echo "$domain_result" | awk -F'|' '{print $3}')"
+		success=$((success + domain_success))
+		total=$((total + domain_total))
+
+		if stop_requested; then
+			stopped=1
+			break
+		fi
+	done < "$TEST_TMP_DOMAINS"
+
+	json_init
+	json_add_string strategy "$strategy"
+	json_add_int success "$success"
+	json_add_int total "$total"
+	json_add_string result "$success/$total"
+	json_add_boolean stopped "$stopped"
+	json_add_array domains
+	while IFS='|' read -r domain_result domain_success domain_total; do
+		[ -n "$domain_result" ] || continue
+		json_add_object
+		json_add_string domain "$domain_result"
+		json_add_int success "$domain_success"
+		json_add_int total "$domain_total"
+		json_close_object
+	done < "$TEST_TMP_RESULTS"
+	json_close_array
+	json_dump
+}
+
+case "$1" in
+	status)
+		json_status
+		;;
+	list-strategies)
+		list_strategies
+		;;
+	diagnostics)
+		diagnostics
+		;;
+	service)
+		service_action "$2"
+		;;
+	apply)
+		apply_strategy "$2" "$3"
+		;;
+	test-strategy)
+		test_strategy "$2" "$3" "$4"
+		;;
+	stop-test)
+		stop_test
+		;;
+	*)
+		echo "Usage: $HELPER_NAME status|list-strategies|diagnostics|service <start|stop|restart>|apply <strategy> <enabled>|test-strategy <strategy> [domains] [requests]|stop-test" >&2
+		exit 1
+		;;
+esac

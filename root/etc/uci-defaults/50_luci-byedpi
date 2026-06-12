@@ -1,0 +1,21 @@
+#!/bin/sh
+
+if [ -f /etc/config/byedpi ]; then
+	cmd_opts="$(uci -q get byedpi.main.cmd_opts || true)"
+	legacy_opts="$(uci -q get byedpi.main.options || true)"
+
+	if [ -z "$cmd_opts" ] && [ -n "$legacy_opts" ]; then
+		uci set byedpi.main.cmd_opts="$legacy_opts"
+		uci commit byedpi
+	elif [ -n "$cmd_opts" ] && [ -z "$legacy_opts" ]; then
+		uci set byedpi.main.options="$cmd_opts"
+		uci commit byedpi
+	fi
+fi
+
+rm -f /var/luci-indexcache*
+rm -f /tmp/luci-indexcache*
+
+[ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd reload
+
+exit 0

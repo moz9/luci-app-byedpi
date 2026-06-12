@@ -1,0 +1,14 @@
+{
+  "admin/services/byedpi": {
+    "title": "ByeDPI",
+    "order": 43,
+    "action": {
+      "type": "view",
+      "path": "byedpi/main"
+    },
+    "depends": {
+      "acl": [ "luci-app-byedpi" ],
+      "uci": { "byedpi": true }
+    }
+  }
+}
