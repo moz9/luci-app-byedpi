@@ -7,6 +7,7 @@ REPO_URL="${REPO_URL:-https://github.com/moz9/luci-app-byedpi}"
 REF="${REF:-main}"
 ARCHIVE_URL="${ARCHIVE_URL:-${REPO_URL%/}/archive/refs/heads/${REF}.tar.gz}"
 BYEDPI_AUTO_INSTALL="${BYEDPI_AUTO_INSTALL:-1}"
+BYEDPI_START="${BYEDPI_START:-1}"
 BYEDPI_RELEASE_API="${BYEDPI_RELEASE_API:-https://api.github.com/repos/DPITrickster/ByeDPI-OpenWrt/releases/latest}"
 PODKOP_CONFIGURE="${PODKOP_CONFIGURE:-1}"
 PODKOP_PROXY_STRING="${PODKOP_PROXY_STRING:-socks5://127.0.0.1:1080#byedpi}"
@@ -141,7 +142,7 @@ normalize_byedpi_config() {
 	local cmd_opts legacy_opts
 
 	uci -q get byedpi.main >/dev/null 2>&1 || uci set byedpi.main=byedpi
-	uci -q get byedpi.main.enabled >/dev/null 2>&1 || uci set byedpi.main.enabled="1"
+	uci set byedpi.main.enabled="1"
 
 	cmd_opts="$(uci -q get byedpi.main.cmd_opts || true)"
 	legacy_opts="$(uci -q get byedpi.main.options || true)"
@@ -155,12 +156,25 @@ normalize_byedpi_config() {
 	uci commit byedpi
 }
 
+start_byedpi_service() {
+	[ "$BYEDPI_START" = "1" ] || {
+		info "Skipping ByeDPI service start"
+		return 0
+	}
+
+	[ -x /etc/init.d/byedpi ] || return 0
+	/etc/init.d/byedpi enable >/dev/null 2>&1 || true
+	/etc/init.d/byedpi restart >/dev/null 2>&1 || true
+	info "Started ByeDPI service"
+}
+
 ensure_byedpi() {
 	local arch ext url package
 
 	if has_byedpi; then
 		info "ByeDPI is already installed"
 		normalize_byedpi_config
+		start_byedpi_service
 		return 0
 	fi
 
@@ -180,6 +194,7 @@ ensure_byedpi() {
 
 	has_byedpi || die "ByeDPI package was installed, but /usr/bin/ciadpi or /etc/init.d/byedpi is still missing"
 	normalize_byedpi_config
+	start_byedpi_service
 }
 
 configure_podkop_byedpi() {
