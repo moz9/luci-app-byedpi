@@ -44,7 +44,6 @@
 ByeDPI из релизов
 [DPITrickster/ByeDPI-OpenWrt](https://github.com/DPITrickster/ByeDPI-OpenWrt).
 Пакет выбирается по архитектуре роутера и пакетному менеджеру `apk` или `opkg`.
-После этого установщик включает автозапуск ByeDPI и перезапускает сервис.
 
 Оригинальная инструкция по ручной установке ByeDPI и настройке связки с Podkop:
 
@@ -84,12 +83,6 @@ curl -fsSL https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.s
 wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | BYEDPI_AUTO_INSTALL=0 sh
 ```
 
-Если нужно не запускать сервис ByeDPI во время установки:
-
-```sh
-wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | BYEDPI_START=0 sh
-```
-
 Если нужно отключить автоматическую настройку Podkop:
 
 ```sh
@@ -120,9 +113,9 @@ sh /tmp/install-luci-app-byedpi.sh
 ```
 
 Установщик перезаписывает только файлы этой LuCI-встройки и очищает кэш LuCI.
-Если ByeDPI уже установлен, он не переустанавливается. Установщик нормализует
-`byedpi.main.cmd_opts/options`, включает автозапуск и перезапускает сервис, чтобы
-локальный SOCKS `127.0.0.1:1080` был доступен сразу после установки.
+Если ByeDPI уже установлен, он не переустанавливается. Конфиг
+`/etc/config/byedpi` не меняется, кроме нормализации `cmd_opts/options` и случая,
+когда вы сами нажимаете `Сохранить и перезапустить` в интерфейсе.
 
 Если установлен Podkop, установщик создает или обновляет только named section
 `podkop.byedpi`:
