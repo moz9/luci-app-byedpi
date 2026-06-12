@@ -8,6 +8,9 @@ REF="${REF:-main}"
 ARCHIVE_URL="${ARCHIVE_URL:-${REPO_URL%/}/archive/refs/heads/${REF}.tar.gz}"
 BYEDPI_AUTO_INSTALL="${BYEDPI_AUTO_INSTALL:-1}"
 BYEDPI_RELEASE_API="${BYEDPI_RELEASE_API:-https://api.github.com/repos/DPITrickster/ByeDPI-OpenWrt/releases/latest}"
+PODKOP_CONFIGURE="${PODKOP_CONFIGURE:-1}"
+PODKOP_PROXY_STRING="${PODKOP_PROXY_STRING:-socks5://127.0.0.1:1080#byedpi}"
+PODKOP_RESOLVE_REAL_IP="${PODKOP_RESOLVE_REAL_IP:-1}"
 WORK_DIR="${TMPDIR:-/tmp}/${APP_NAME}.$$"
 
 die() {
@@ -179,6 +182,29 @@ ensure_byedpi() {
 	normalize_byedpi_config
 }
 
+configure_podkop_byedpi() {
+	[ "$PODKOP_CONFIGURE" = "1" ] || {
+		info "Skipping Podkop byedpi section"
+		return 0
+	}
+
+	if [ ! -f /etc/config/podkop ]; then
+		info "Podkop config was not found, skipping Podkop integration"
+		return 0
+	fi
+
+	uci -q get podkop.byedpi >/dev/null 2>&1 || uci set podkop.byedpi=section
+	uci set podkop.byedpi.proxy_string="$PODKOP_PROXY_STRING"
+	uci set podkop.byedpi.resolve_real_ip_for_routing="$PODKOP_RESOLVE_REAL_IP"
+	uci commit podkop
+
+	if [ -x /etc/init.d/podkop ]; then
+		/etc/init.d/podkop reload >/dev/null 2>&1 || /etc/init.d/podkop restart >/dev/null 2>&1 || true
+	fi
+
+	info "Configured podkop.byedpi"
+}
+
 install_files() {
 	local src="$1"
 
@@ -204,6 +230,7 @@ main() {
 
 	trap cleanup EXIT INT TERM
 	check_openwrt
+	configure_podkop_byedpi
 
 	if src="$(find_local_source)"; then
 		info "Using local source: $src"

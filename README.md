@@ -16,7 +16,8 @@
 - диагностика `ciadpi`, init-скрипта, UCI-конфига, SOCKS-порта и интеграции Podkop;
 - тестер стратегий через `socks5://127.0.0.1:1080`;
 - тест выбранной, текущей, топ-10 или всех стратегий;
-- остановка выполняющейся очереди тестов с возвратом прежней стратегии.
+- остановка выполняющейся очереди тестов с возвратом прежней стратегии;
+- автоматическое добавление секции `podkop.byedpi` при наличии Podkop.
 
 ## Источники и атрибуция
 
@@ -55,15 +56,13 @@ https://github.com/DPITrickster/Podkop-ByeDPI-OpenWRT
 Выполните на роутере по SSH:
 
 ```sh
-wget -O /tmp/install-luci-app-byedpi.sh https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh
-sh /tmp/install-luci-app-byedpi.sh
+wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | sh
 ```
 
 Если `wget` не умеет HTTPS, используйте `curl`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh -o /tmp/install-luci-app-byedpi.sh
-sh /tmp/install-luci-app-byedpi.sh
+curl -fsSL https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | sh
 ```
 
 После установки откройте LuCI:
@@ -81,13 +80,19 @@ sh /tmp/install-luci-app-byedpi.sh
 Если нужно поставить только LuCI-встройку и не трогать пакет ByeDPI:
 
 ```sh
-BYEDPI_AUTO_INSTALL=0 sh /tmp/install-luci-app-byedpi.sh
+wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | BYEDPI_AUTO_INSTALL=0 sh
+```
+
+Если нужно отключить автоматическую настройку Podkop:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | PODKOP_CONFIGURE=0 sh
 ```
 
 ## Установка из другой ветки или форка
 
 ```sh
-REPO_URL=https://github.com/moz9/luci-app-byedpi REF=main sh /tmp/install-luci-app-byedpi.sh
+wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | REPO_URL=https://github.com/moz9/luci-app-byedpi REF=main sh
 ```
 
 Можно поставить из локальной копии репозитория:
@@ -109,8 +114,20 @@ sh /tmp/install-luci-app-byedpi.sh
 
 Установщик перезаписывает только файлы этой LuCI-встройки и очищает кэш LuCI.
 Если ByeDPI уже установлен, он не переустанавливается. Конфиг
-`/etc/config/byedpi`, Podkop и правила маршрутизации не меняются, кроме случая,
+`/etc/config/byedpi` не меняется, кроме нормализации `cmd_opts/options` и случая,
 когда вы сами нажимаете `Сохранить и перезапустить` в интерфейсе.
+
+Если установлен Podkop, установщик создает или обновляет только named section
+`podkop.byedpi`:
+
+```sh
+podkop.byedpi=section
+podkop.byedpi.proxy_string='socks5://127.0.0.1:1080#byedpi'
+podkop.byedpi.resolve_real_ip_for_routing='1'
+```
+
+Остальные секции Podkop, списки доменов, прокси и правила маршрутизации не
+перезаписываются.
 
 ## Удаление
 
