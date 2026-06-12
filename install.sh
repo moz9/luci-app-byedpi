@@ -7,7 +7,16 @@ REPO_URL="${REPO_URL:-https://github.com/moz9/luci-app-byedpi}"
 REF="${REF:-main}"
 ARCHIVE_URL="${ARCHIVE_URL:-${REPO_URL%/}/archive/refs/heads/${REF}.tar.gz}"
 BYEDPI_AUTO_INSTALL="${BYEDPI_AUTO_INSTALL:-1}"
+BYEDPI_START="${BYEDPI_START:-1}"
 BYEDPI_RELEASE_API="${BYEDPI_RELEASE_API:-https://api.github.com/repos/DPITrickster/ByeDPI-OpenWrt/releases/latest}"
+PODKOP_CONFIGURE="${PODKOP_CONFIGURE:-1}"
+PODKOP_SECTION="${PODKOP_SECTION:-byedpi}"
+PODKOP_PROXY_STRING="${PODKOP_PROXY_STRING:-socks5://127.0.0.1:1080#byedpi}"
+PODKOP_RESOLVE_REAL_IP="${PODKOP_RESOLVE_REAL_IP:-1}"
+PODKOP_BYEDPI_COMMUNITY_LISTS="${PODKOP_BYEDPI_COMMUNITY_LISTS:-youtube}"
+PODKOP_RESTART="${PODKOP_RESTART:-1}"
+STATE_DIR="/etc/luci-app-byedpi"
+STATE_FILE="$STATE_DIR/install.state"
 WORK_DIR="${TMPDIR:-/tmp}/${APP_NAME}.$$"
 
 die() {
@@ -73,14 +82,51 @@ check_openwrt() {
 	have jsonfilter || die "jsonfilter is required; install luci-base"
 	[ -f /usr/share/libubox/jshn.sh ] || die "jshn.sh is required; install libubox/luci-base"
 	[ -d /www/luci-static/resources ] || die "LuCI static directory was not found; install luci-base"
-
-	if [ "${SKIP_BYEDPI_CHECK:-0}" != "1" ]; then
-		ensure_byedpi
-	fi
 }
 
 has_byedpi() {
 	[ -x /usr/bin/ciadpi ] && [ -x /etc/init.d/byedpi ]
+}
+
+bool_status() {
+	"$@" >/dev/null 2>&1 && printf '%s\n' 1 || printf '%s\n' 0
+}
+
+init_state() {
+	[ -f "$STATE_FILE" ] && return 0
+
+	mkdir -p "$STATE_DIR"
+	{
+		printf 'byedpi_was_installed=%s\n' "$(bool_status has_byedpi)"
+		if [ -x /etc/init.d/byedpi ]; then
+			printf 'byedpi_was_enabled=%s\n' "$(bool_status /etc/init.d/byedpi enabled)"
+			printf 'byedpi_was_running=%s\n' "$(bool_status /etc/init.d/byedpi status)"
+		else
+			printf 'byedpi_was_enabled=0\n'
+			printf 'byedpi_was_running=0\n'
+		fi
+		if [ -f /etc/config/podkop ] && uci -q get "podkop.$PODKOP_SECTION" >/dev/null 2>&1; then
+			printf 'podkop_section_existed=1\n'
+		else
+			printf 'podkop_section_existed=0\n'
+		fi
+		printf 'podkop_section=%s\n' "$PODKOP_SECTION"
+		printf 'byedpi_installed_by_installer=0\n'
+		printf 'podkop_section_created_by_installer=0\n'
+	} > "$STATE_FILE"
+}
+
+set_state() {
+	local key="$1" value="$2" tmp="$STATE_FILE.tmp"
+
+	mkdir -p "$STATE_DIR"
+	if [ -f "$STATE_FILE" ]; then
+		grep -v "^${key}=" "$STATE_FILE" > "$tmp" || true
+	else
+		: > "$tmp"
+	fi
+	printf '%s=%s\n' "$key" "$value" >> "$tmp"
+	mv "$tmp" "$STATE_FILE"
 }
 
 byedpi_package_arch() {
@@ -134,6 +180,18 @@ install_byedpi_package() {
 	esac
 }
 
+start_byedpi_service() {
+	[ "$BYEDPI_START" = "1" ] || {
+		info "Skipping ByeDPI service start"
+		return 0
+	}
+
+	[ -x /etc/init.d/byedpi ] || return 0
+	/etc/init.d/byedpi enable >/dev/null 2>&1 || true
+	/etc/init.d/byedpi restart >/dev/null 2>&1 || true
+	info "Started ByeDPI service"
+}
+
 normalize_byedpi_config() {
 	local cmd_opts legacy_opts
 
@@ -158,6 +216,7 @@ ensure_byedpi() {
 	if has_byedpi; then
 		info "ByeDPI is already installed"
 		normalize_byedpi_config
+		start_byedpi_service
 		return 0
 	fi
 
@@ -174,9 +233,60 @@ ensure_byedpi() {
 
 	info "Installing ByeDPI"
 	install_byedpi_package "$package" "$ext"
+	set_state byedpi_installed_by_installer 1
 
 	has_byedpi || die "ByeDPI package was installed, but /usr/bin/ciadpi or /etc/init.d/byedpi is still missing"
 	normalize_byedpi_config
+	start_byedpi_service
+}
+
+configure_podkop_byedpi() {
+	local list exists=0
+
+	[ "$PODKOP_CONFIGURE" = "1" ] || {
+		info "Skipping Podkop integration"
+		return 0
+	}
+
+	if [ ! -f /etc/config/podkop ]; then
+		info "Podkop config was not found, skipping Podkop integration"
+		return 0
+	fi
+
+	if uci -q get "podkop.$PODKOP_SECTION" >/dev/null 2>&1; then
+		exists=1
+	fi
+
+	if [ "$exists" = "1" ]; then
+		info "Podkop section '$PODKOP_SECTION' already exists, leaving it unchanged"
+		return 0
+	fi
+
+	uci set "podkop.$PODKOP_SECTION=section"
+	uci set "podkop.$PODKOP_SECTION.connection_type=proxy"
+	uci set "podkop.$PODKOP_SECTION.proxy_config_type=url"
+	uci set "podkop.$PODKOP_SECTION.proxy_string=$PODKOP_PROXY_STRING"
+	uci set "podkop.$PODKOP_SECTION.resolve_real_ip_for_routing=$PODKOP_RESOLVE_REAL_IP"
+	uci set "podkop.$PODKOP_SECTION.user_domain_list_type=disabled"
+	uci set "podkop.$PODKOP_SECTION.user_subnet_list_type=disabled"
+	uci set "podkop.$PODKOP_SECTION.mixed_proxy_enabled=0"
+	uci set "podkop.$PODKOP_SECTION.enable_udp_over_tcp=0"
+
+	uci -q delete "podkop.$PODKOP_SECTION.community_lists" || true
+	if [ -n "$PODKOP_BYEDPI_COMMUNITY_LISTS" ] && [ "$PODKOP_BYEDPI_COMMUNITY_LISTS" != "none" ]; then
+		for list in $PODKOP_BYEDPI_COMMUNITY_LISTS; do
+			uci add_list "podkop.$PODKOP_SECTION.community_lists=$list"
+		done
+	fi
+
+	uci commit podkop
+	[ "$exists" = "0" ] && set_state podkop_section_created_by_installer 1
+
+	if [ "$PODKOP_RESTART" = "1" ] && [ -x /etc/init.d/podkop ]; then
+		/etc/init.d/podkop restart >/dev/null 2>&1 || true
+	fi
+
+	info "Configured Podkop section '$PODKOP_SECTION'"
 }
 
 install_files() {
@@ -204,6 +314,12 @@ main() {
 
 	trap cleanup EXIT INT TERM
 	check_openwrt
+	init_state
+
+	if [ "${SKIP_BYEDPI_CHECK:-0}" != "1" ]; then
+		ensure_byedpi
+	fi
+	configure_podkop_byedpi
 
 	if src="$(find_local_source)"; then
 		info "Using local source: $src"

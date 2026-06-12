@@ -16,7 +16,8 @@
 - диагностика `ciadpi`, init-скрипта, UCI-конфига, SOCKS-порта и интеграции Podkop;
 - тестер стратегий через `socks5://127.0.0.1:1080`;
 - тест выбранной, текущей, топ-10 или всех стратегий;
-- остановка выполняющейся очереди тестов с возвратом прежней стратегии.
+- остановка выполняющейся очереди тестов с возвратом прежней стратегии;
+- полная установка в одну команду: ByeDPI, LuCI-встройка и секция Podkop.
 
 ## Источники и атрибуция
 
@@ -43,6 +44,10 @@
 ByeDPI из релизов
 [DPITrickster/ByeDPI-OpenWrt](https://github.com/DPITrickster/ByeDPI-OpenWrt).
 Пакет выбирается по архитектуре роутера и пакетному менеджеру `apk` или `opkg`.
+После установки ByeDPI включается и запускается.
+
+Если установлен Podkop, установщик создает отдельную секцию `byedpi` только если
+ее еще нет. Уже существующая секция `byedpi` не перезаписывается.
 
 Оригинальная инструкция по ручной установке ByeDPI и настройке связки с Podkop:
 
@@ -55,15 +60,42 @@ https://github.com/DPITrickster/Podkop-ByeDPI-OpenWRT
 Выполните на роутере по SSH:
 
 ```sh
-wget -O /tmp/install-luci-app-byedpi.sh https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh
-sh /tmp/install-luci-app-byedpi.sh
+wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | sh
 ```
 
 Если `wget` не умеет HTTPS, используйте `curl`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh -o /tmp/install-luci-app-byedpi.sh
-sh /tmp/install-luci-app-byedpi.sh
+curl -fsSL https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | sh
+```
+
+Установщик делает:
+
+- ставит ByeDPI, если `/usr/bin/ciadpi` и `/etc/init.d/byedpi` отсутствуют;
+- нормализует `byedpi.main.cmd_opts` и `byedpi.main.options`;
+- включает и запускает ByeDPI;
+- ставит файлы `luci-app-byedpi`;
+- если найден Podkop и секции `byedpi` еще нет, добавляет:
+
+```sh
+config section 'byedpi'
+	option connection_type 'proxy'
+	option proxy_config_type 'url'
+	option proxy_string 'socks5://127.0.0.1:1080#byedpi'
+	option resolve_real_ip_for_routing '1'
+	list community_lists 'youtube'
+```
+
+Список по умолчанию - `youtube`. Можно заменить его при установке:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | PODKOP_BYEDPI_COMMUNITY_LISTS="youtube google" sh
+```
+
+Если секция Podkop не нужна:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | PODKOP_CONFIGURE=0 sh
 ```
 
 После установки откройте LuCI:
@@ -81,13 +113,13 @@ sh /tmp/install-luci-app-byedpi.sh
 Если нужно поставить только LuCI-встройку и не трогать пакет ByeDPI:
 
 ```sh
-BYEDPI_AUTO_INSTALL=0 sh /tmp/install-luci-app-byedpi.sh
+wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | BYEDPI_AUTO_INSTALL=0 sh
 ```
 
 ## Установка из другой ветки или форка
 
 ```sh
-REPO_URL=https://github.com/moz9/luci-app-byedpi REF=main sh /tmp/install-luci-app-byedpi.sh
+wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | REPO_URL=https://github.com/moz9/luci-app-byedpi REF=main sh
 ```
 
 Можно поставить из локальной копии репозитория:
@@ -103,24 +135,29 @@ sh install.sh
 Повторно запустите установщик:
 
 ```sh
-wget -O /tmp/install-luci-app-byedpi.sh https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh
-sh /tmp/install-luci-app-byedpi.sh
+wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | sh
 ```
 
-Установщик перезаписывает только файлы этой LuCI-встройки и очищает кэш LuCI.
-Если ByeDPI уже установлен, он не переустанавливается. Конфиг
-`/etc/config/byedpi`, Podkop и правила маршрутизации не меняются, кроме случая,
-когда вы сами нажимаете `Сохранить и перезапустить` в интерфейсе.
+Установщик перезаписывает файлы этой LuCI-встройки и очищает кэш LuCI. Если
+ByeDPI уже установлен, он не переустанавливается. Если секция `podkop.byedpi`
+уже есть, она не перезаписывается.
 
 ## Удаление
 
 ```sh
-wget -O /tmp/uninstall-luci-app-byedpi.sh https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/uninstall.sh
-sh /tmp/uninstall-luci-app-byedpi.sh
+wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/uninstall.sh | sh
 ```
 
-Удаление убирает только файлы `luci-app-byedpi`. ByeDPI, Podkop и
-`/etc/config/byedpi` не удаляются.
+Удаление убирает файлы `luci-app-byedpi`. Если установка создала секцию
+`podkop.byedpi`, она удаляется. Если установка сама поставила пакет ByeDPI, он
+удаляется. Если ByeDPI уже был установлен до запуска установщика, пакет не
+удаляется, а состояние сервиса возвращается к сохраненному перед установкой.
+
+Для принудительного удаления секции Podkop и пакета ByeDPI:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/uninstall.sh | REMOVE_PODKOP_BYEDPI=1 REMOVE_BYEDPI=1 sh
+```
 
 ## Сборка пакета OpenWrt
 
