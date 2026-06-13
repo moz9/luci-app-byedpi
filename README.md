@@ -69,26 +69,6 @@ config section 'byedpi'
 для прокси и диагностики. Списки `community_lists` установщик не задает:
 пользователь выбирает их сам в Podkop.
 
-## Опции установки
-
-Не ставить пакет ByeDPI автоматически:
-
-```sh
-wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | BYEDPI_AUTO_INSTALL=0 sh
-```
-
-Не трогать Podkop:
-
-```sh
-wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | PODKOP_CONFIGURE=0 sh
-```
-
-Поставить из другой ветки или форка:
-
-```sh
-wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | REPO_URL=https://github.com/moz9/luci-app-byedpi REF=main sh
-```
-
 ## Обновление
 
 Повторно запустите установщик:
