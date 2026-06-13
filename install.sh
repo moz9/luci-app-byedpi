@@ -258,8 +258,9 @@ configure_podkop_byedpi() {
 	fi
 
 	if [ "$exists" = "1" ]; then
-		info "Podkop section '$PODKOP_SECTION' already exists, leaving it unchanged"
-		return 0
+		info "Normalizing Podkop section '$PODKOP_SECTION'"
+	else
+		info "Creating Podkop section '$PODKOP_SECTION'"
 	fi
 
 	uci set "podkop.$PODKOP_SECTION=section"
@@ -272,11 +273,13 @@ configure_podkop_byedpi() {
 	uci set "podkop.$PODKOP_SECTION.mixed_proxy_enabled=0"
 	uci set "podkop.$PODKOP_SECTION.enable_udp_over_tcp=0"
 
-	uci -q delete "podkop.$PODKOP_SECTION.community_lists" || true
-	if [ -n "$PODKOP_BYEDPI_COMMUNITY_LISTS" ] && [ "$PODKOP_BYEDPI_COMMUNITY_LISTS" != "none" ]; then
-		for list in $PODKOP_BYEDPI_COMMUNITY_LISTS; do
-			uci add_list "podkop.$PODKOP_SECTION.community_lists=$list"
-		done
+	if [ "$exists" = "0" ]; then
+		uci -q delete "podkop.$PODKOP_SECTION.community_lists" || true
+		if [ -n "$PODKOP_BYEDPI_COMMUNITY_LISTS" ] && [ "$PODKOP_BYEDPI_COMMUNITY_LISTS" != "none" ]; then
+			for list in $PODKOP_BYEDPI_COMMUNITY_LISTS; do
+				uci add_list "podkop.$PODKOP_SECTION.community_lists=$list"
+			done
+		fi
 	fi
 
 	uci commit podkop
