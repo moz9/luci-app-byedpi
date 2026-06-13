@@ -33,21 +33,25 @@ LuCI-страница для управления ByeDPI на OpenWrt.
 Если ByeDPI еще не установлен, установщик попробует поставить пакет `byedpi`
 из релизов [DPITrickster/ByeDPI-OpenWrt](https://github.com/DPITrickster/ByeDPI-OpenWrt).
 
-## Установка
+## Автоматическая установка
 
-На роутере по SSH:
+Основной способ установки — одна команда на роутере по SSH:
 
 ```sh
 wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | sh
 ```
 
-Или через `curl`:
+Этого достаточно: установщик сам поставит нужные файлы, включит сервис и
+подготовит интеграцию с LuCI. Все блоки ниже — только пояснения и
+дополнительные варианты.
+
+Если на роутере нет `wget`, можно выполнить ту же установку через `curl`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | sh
 ```
 
-Установщик:
+Что делает установщик:
 
 - ставит ByeDPI, если нет `/usr/bin/ciadpi` или `/etc/init.d/byedpi`;
 - включает и запускает ByeDPI;
