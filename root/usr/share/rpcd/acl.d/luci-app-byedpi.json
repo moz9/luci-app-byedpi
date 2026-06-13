@@ -8,13 +8,13 @@
       "ubus": {
         "service": [ "list" ]
       },
-      "uci": [ "byedpi" ]
+      "uci": [ "byedpi", "podkop" ]
     },
     "write": {
       "file": {
         "/usr/libexec/byedpi-luci": [ "exec" ]
       },
-      "uci": [ "byedpi" ]
+      "uci": [ "byedpi", "podkop" ]
     }
   }
 }

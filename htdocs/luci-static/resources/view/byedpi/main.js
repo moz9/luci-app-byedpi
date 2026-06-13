@@ -9,11 +9,13 @@ const STATUS_NODE_ID = "byedpi-status";
 const DIAGNOSTICS_NODE_ID = "byedpi-diagnostics";
 const RESULTS_NODE_ID = "byedpi-test-results";
 const LOG_NODE_ID = "byedpi-test-log";
+const TEST_PROGRESS_NODE_ID = "byedpi-test-progress";
 
 let strategies = [];
 let activeTab = "settings";
 let testing = false;
 let stopRequested = false;
+let lastProgressKey = "";
 
 function injectStyles() {
 	if (document.getElementById("byedpi-luci-style"))
@@ -162,6 +164,14 @@ function injectStyles() {
 
 		.byedpi-muted {
 			color: var(--text-color-medium, #666);
+		}
+
+		.byedpi-progress {
+			display: grid;
+			gap: 4px;
+			padding: 8px 10px;
+			border: 1px solid var(--border-color-low, #ddd);
+			border-radius: 4px;
 		}
 	`));
 }
@@ -345,6 +355,75 @@ function clearLog() {
 		node.textContent = "";
 }
 
+function delay(ms) {
+	return new Promise(function(resolve) {
+		window.setTimeout(resolve, ms);
+	});
+}
+
+function renderTestProgress(status) {
+	const node = document.getElementById(TEST_PROGRESS_NODE_ID);
+	if (!node)
+		return;
+
+	if (!status || !status.active) {
+		node.replaceChildren(E("span", { class: "byedpi-muted" }, _("Тест не запущен")));
+		return;
+	}
+
+	const tested = parseInt(status.tested, 10) || 0;
+	const totalDomains = parseInt(status.total_domains, 10) || 0;
+	const result = status.result || "0/0";
+	const current = status.current_domain || "";
+	const finished = !!status.finished;
+	const stopped = !!status.stopped;
+
+	let stateText = _("Идет тест");
+	let badgeClass = "warn";
+	if (finished && stopped) {
+		stateText = _("Остановлено");
+		badgeClass = "bad";
+	}
+	else if (finished) {
+		stateText = _("Готово");
+		badgeClass = "ok";
+	}
+
+	node.replaceChildren(E("div", { class: "byedpi-progress" }, [
+		E("div", { class: "byedpi-status-line" }, [
+			E("span", { class: "byedpi-badge " + badgeClass }, stateText),
+			E("span", {}, _("Домены: ") + tested + "/" + totalDomains),
+			E("span", {}, _("Итог: ") + result)
+		]),
+		current ? E("span", { class: "byedpi-muted" }, _("Сейчас: ") + current) : "",
+		status.message ? E("span", { class: "byedpi-muted" }, status.message) : ""
+	]));
+}
+
+function logProgress(status) {
+	const key = [
+		status && status.tested,
+		status && status.total_domains,
+		status && status.result,
+		status && status.current_domain,
+		status && status.finished,
+		status && status.stopped
+	].join("|");
+
+	if (key === lastProgressKey)
+		return;
+
+	lastProgressKey = key;
+
+	if (!status || !status.active)
+		return;
+
+	if (status.finished)
+		return;
+
+	logLine(_("Прогресс: ") + (status.tested || 0) + "/" + (status.total_domains || 0) + " · " + (status.result || "0/0") + (status.current_domain ? " · " + status.current_domain : ""));
+}
+
 function appendResult(result) {
 	const table = document.getElementById(RESULTS_NODE_ID);
 	if (!table)
@@ -423,11 +502,19 @@ function setTestingState(isTesting) {
 	setButtonDisabled("byedpi-test-stop", !testing || stopRequested);
 }
 
-function testTimeoutMs(limit, requests) {
-	const domains = parseInt(limit, 10) || 8;
-	const perDomain = parseInt(requests, 10) || 1;
+async function waitForStrategyTest() {
+	while (testing) {
+		const status = await execJson([ "test-status" ], 10000);
+		renderTestProgress(status);
+		logProgress(status);
 
-	return Math.max(180000, domains * perDomain * 11000 + 45000);
+		if (status.finished)
+			return status;
+
+		await delay(1500);
+	}
+
+	return execJson([ "test-status" ], 10000);
 }
 
 function runStrategyTest(strategy) {
@@ -442,8 +529,12 @@ function runStrategyTest(strategy) {
 	}
 
 	logLine(_("Тестирую: ") + strategy);
+	lastProgressKey = "";
 
-	return execJson([ "test-strategy", strategy, limit, requests ], testTimeoutMs(limit, requests)).then(function(result) {
+	return execJson([ "start-test", strategy, limit, requests ], 10000).then(function(status) {
+		renderTestProgress(status);
+		return waitForStrategyTest();
+	}).then(function(result) {
 		appendResult(result);
 		if (result.stopped)
 			logLine(_("Остановлено: ") + (result.result || "0/0") + " · " + strategy);
@@ -482,6 +573,7 @@ async function runStrategyQueue(items) {
 	}
 
 	clearLog();
+	renderTestProgress(null);
 	stopRequested = false;
 	setTestingState(true);
 
@@ -513,7 +605,7 @@ function stopTests() {
 	setTestingState(true);
 	logLine(_("Останавливаю тесты..."));
 
-	return execJson([ "stop-test" ], 10000).catch(function(err) {
+	return execJson([ "stop-test" ], 10000).then(renderTestProgress).catch(function(err) {
 		const message = err.message || err;
 		logLine(_("Ошибка остановки: ") + message);
 		notify(message, "error");
@@ -698,6 +790,7 @@ function renderTesterTab(status) {
 				E("button", { id: "byedpi-test-stop", class: "btn cbi-button cbi-button-remove", disabled: "disabled" }, _("Стоп")),
 				E("button", { id: "byedpi-clear-results", class: "btn cbi-button" }, _("Очистить"))
 			]),
+			E("div", { id: TEST_PROGRESS_NODE_ID }, E("span", { class: "byedpi-muted" }, _("Тест не запущен"))),
 			E("p", { class: "byedpi-muted" }, _("Во время теста ByeDPI временно перезапускается с проверяемой стратегией, затем возвращается прежняя стратегия."))
 		]),
 		E("div", { class: "byedpi-grid" }, [

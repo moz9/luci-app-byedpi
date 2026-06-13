@@ -245,14 +245,24 @@ restore_strategy() {
 
 remove_lock_dir() {
 	[ -d "$LOCK_DIR" ] || return 0
+	rm -rf "$LOCK_DIR"
+}
 
-	rm -f \
-		"$LOCK_DIR/pid" \
-		"$LOCK_DIR/original" \
-		"$LOCK_DIR/original_present" \
-		"$LOCK_DIR/was_running" \
-		"$LOCK_DIR/stop"
-	rmdir "$LOCK_DIR" 2>/dev/null || true
+lock_get() {
+	local name="$1" fallback="${2:-}" path
+
+	path="$LOCK_DIR/$name"
+
+	if [ -f "$path" ]; then
+		cat "$path"
+	else
+		printf '%s' "$fallback"
+	fi
+}
+
+lock_set() {
+	local name="$1" value="$2"
+	printf '%s\n' "$value" > "$LOCK_DIR/$name"
 }
 
 restore_from_lock() {
@@ -260,6 +270,7 @@ restore_from_lock() {
 
 	[ -d "$LOCK_DIR" ] || return 0
 	[ -f "$LOCK_DIR/original_present" ] || return 0
+	[ "$(lock_get restored 0)" = "1" ] && return 0
 
 	original="$(cat "$LOCK_DIR/original" 2>/dev/null || true)"
 	original_present="$(cat "$LOCK_DIR/original_present" 2>/dev/null || echo 0)"
@@ -269,14 +280,7 @@ restore_from_lock() {
 	[ "$was_running" = "1" ] || was_running=0
 
 	restore_strategy "$original" "$original_present" "$was_running"
-}
-
-cleanup_test() {
-	trap - EXIT INT TERM
-	restore_from_lock
-	[ -n "${TEST_TMP_DOMAINS:-}" ] && rm -f "$TEST_TMP_DOMAINS"
-	[ -n "${TEST_TMP_RESULTS:-}" ] && rm -f "$TEST_TMP_RESULTS"
-	remove_lock_dir
+	lock_set restored 1
 }
 
 pid_is_running() {
@@ -288,6 +292,11 @@ clear_stale_lock() {
 	local pid
 
 	[ -d "$LOCK_DIR" ] || return 0
+	if [ "$(lock_get finished 0)" = "1" ]; then
+		remove_lock_dir
+		return 0
+	fi
+
 	pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
 	pid_is_running "$pid" && return 0
 
@@ -311,14 +320,15 @@ stop_test() {
 		return 0
 	fi
 
+	if [ "$(lock_get finished 0)" = "1" ]; then
+		test_status
+		return 0
+	fi
+
 	pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
 	if pid_is_running "$pid"; then
 		: > "$LOCK_DIR/stop"
-		json_init
-		json_add_boolean stopping 1
-		json_add_boolean stopped 0
-		json_add_string message "Strategy test stop requested"
-		json_dump
+		test_status
 		return 0
 	fi
 
@@ -332,9 +342,81 @@ stop_test() {
 	json_dump
 }
 
-test_strategy() {
-	local strategy="$1" limit="$2" requests="$3" original original_present=0 was_running=0
-	local tested=0 success=0 total=0 stopped=0 domain_result domain_success domain_total
+emit_no_test_status() {
+	json_init
+	json_add_boolean active 0
+	json_add_boolean running 0
+	json_add_boolean finished 0
+	json_add_boolean stopped 0
+	json_add_string message "${1:-No strategy test is running}"
+	json_add_array domains
+	json_close_array
+	json_dump
+}
+
+test_status() {
+	local pid running=0 finished stopped strategy result success total tested total_domains current_domain message
+	local domain domain_success domain_total
+
+	if [ ! -d "$LOCK_DIR" ]; then
+		emit_no_test_status
+		return 0
+	fi
+
+	pid="$(lock_get pid)"
+	if pid_is_running "$pid"; then
+		running=1
+	fi
+
+	finished="$(lock_get finished 0)"
+	if [ "$running" = "0" ] && [ "$finished" != "1" ]; then
+		restore_from_lock
+		remove_lock_dir
+		emit_no_test_status "Stale strategy test was cleaned up"
+		return 0
+	fi
+
+	stopped="$(lock_get stopped 0)"
+	strategy="$(lock_get strategy)"
+	success="$(lock_get success 0)"
+	total="$(lock_get total 0)"
+	tested="$(lock_get tested 0)"
+	total_domains="$(lock_get total_domains 0)"
+	current_domain="$(lock_get current_domain)"
+	message="$(lock_get message)"
+	result="${success}/${total}"
+
+	json_init
+	json_add_boolean active 1
+	json_add_boolean running "$running"
+	json_add_boolean finished "$finished"
+	json_add_boolean stopped "$stopped"
+	json_add_string pid "$pid"
+	json_add_string strategy "$strategy"
+	json_add_int success "$success"
+	json_add_int total "$total"
+	json_add_int tested "$tested"
+	json_add_int total_domains "$total_domains"
+	json_add_string current_domain "$current_domain"
+	json_add_string result "$result"
+	json_add_string message "$message"
+	json_add_array domains
+	if [ -f "$LOCK_DIR/results" ]; then
+		while IFS='|' read -r domain domain_success domain_total; do
+			[ -n "$domain" ] || continue
+			json_add_object
+			json_add_string domain "$domain"
+			json_add_int success "$domain_success"
+			json_add_int total "$domain_total"
+			json_close_object
+		done < "$LOCK_DIR/results"
+	fi
+	json_close_array
+	json_dump
+}
+
+validate_test_args() {
+	local strategy="$1" limit="$2" requests="$3"
 
 	[ -n "$strategy" ] || {
 		echo "Strategy is empty" >&2
@@ -353,6 +435,16 @@ test_strategy() {
 	[ "$requests" -lt 1 ] && requests=1
 	[ "$requests" -gt 5 ] && requests=5
 
+	printf '%s\n%s\n' "$limit" "$requests"
+}
+
+start_test() {
+	local strategy="$1" limit="$2" requests="$3" original original_present=0 was_running=0 pid normalized
+
+	normalized="$(validate_test_args "$strategy" "$limit" "$requests")" || return 1
+	limit="$(printf '%s\n' "$normalized" | sed -n '1p')"
+	requests="$(printf '%s\n' "$normalized" | sed -n '2p')"
+
 	clear_stale_lock
 
 	if ! mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -360,25 +452,64 @@ test_strategy() {
 		return 1
 	fi
 
-	TEST_TMP_DOMAINS="$(mktemp)"
-	TEST_TMP_RESULTS="$(mktemp)"
-
 	uci -q get byedpi.main.cmd_opts >/dev/null 2>&1 && original_present=1
 	uci -q get byedpi.main.options >/dev/null 2>&1 && original_present=1
 	original="$(uci -q get byedpi.main.cmd_opts || true)"
 	[ -n "$original" ] || original="$(uci -q get byedpi.main.options || true)"
 	/etc/init.d/byedpi status >/dev/null 2>&1 && was_running=1
 
-	echo "$$" > "$LOCK_DIR/pid"
 	printf '%s\n' "$original" > "$LOCK_DIR/original"
-	echo "$original_present" > "$LOCK_DIR/original_present"
-	echo "$was_running" > "$LOCK_DIR/was_running"
+	lock_set original_present "$original_present"
+	lock_set was_running "$was_running"
+	lock_set restored 0
+	lock_set finished 0
+	lock_set stopped 0
+	lock_set success 0
+	lock_set total 0
+	lock_set tested 0
+	lock_set total_domains 0
+	lock_set current_domain ""
+	lock_set strategy "$strategy"
+	lock_set limit "$limit"
+	lock_set requests "$requests"
+	lock_set message "Starting strategy test"
+	: > "$LOCK_DIR/results"
 
-	trap 'cleanup_test' EXIT
-	trap 'cleanup_test; exit 130' INT
-	trap 'cleanup_test; exit 143' TERM
+	"$0" test-worker "$strategy" "$limit" "$requests" </dev/null >"$LOCK_DIR/worker.log" 2>&1 &
+	pid="$!"
+	lock_set pid "$pid"
 
-	clean_lines "$DOMAINS_FILE" > "$TEST_TMP_DOMAINS"
+	test_status
+}
+
+finish_test() {
+	local stopped="$1" message="$2"
+
+	lock_set stopped "$stopped"
+	lock_set current_domain ""
+	lock_set message "$message"
+	restore_from_lock
+	lock_set finished 1
+}
+
+abort_worker() {
+	finish_test 1 "Strategy test was interrupted"
+	exit 0
+}
+
+test_worker() {
+	local strategy="$1" limit="$2" requests="$3"
+	local tested=0 success=0 total=0 stopped=0 domain_result domain_success domain_total total_domains
+
+	[ -d "$LOCK_DIR" ] || exit 1
+
+	trap '' HUP
+	trap abort_worker INT TERM
+
+	clean_lines "$DOMAINS_FILE" | head -n "$limit" > "$LOCK_DIR/domains"
+	total_domains="$(wc -l < "$LOCK_DIR/domains" | tr -d ' ')"
+	lock_set total_domains "${total_domains:-0}"
+	lock_set message "Restarting ByeDPI with test strategy"
 
 	uci set byedpi.main.enabled="1"
 	uci set byedpi.main.cmd_opts="$strategy"
@@ -395,36 +526,41 @@ test_strategy() {
 
 		[ "$tested" -ge "$limit" ] && break
 		tested=$((tested + 1))
+		lock_set current_domain "$domain"
+		lock_set tested "$tested"
+		lock_set message "Testing ${domain}"
 		domain_result="$(test_domain "$domain" "$requests")"
-		echo "$domain_result" >> "$TEST_TMP_RESULTS"
+		echo "$domain_result" >> "$LOCK_DIR/results"
 		domain_success="$(echo "$domain_result" | awk -F'|' '{print $2}')"
 		domain_total="$(echo "$domain_result" | awk -F'|' '{print $3}')"
 		success=$((success + domain_success))
 		total=$((total + domain_total))
+		lock_set success "$success"
+		lock_set total "$total"
 
 		if stop_requested; then
 			stopped=1
 			break
 		fi
-	done < "$TEST_TMP_DOMAINS"
+	done < "$LOCK_DIR/domains"
 
-	json_init
-	json_add_string strategy "$strategy"
-	json_add_int success "$success"
-	json_add_int total "$total"
-	json_add_string result "$success/$total"
-	json_add_boolean stopped "$stopped"
-	json_add_array domains
-	while IFS='|' read -r domain_result domain_success domain_total; do
-		[ -n "$domain_result" ] || continue
-		json_add_object
-		json_add_string domain "$domain_result"
-		json_add_int success "$domain_success"
-		json_add_int total "$domain_total"
-		json_close_object
-	done < "$TEST_TMP_RESULTS"
-	json_close_array
-	json_dump
+	if [ "$stopped" = "1" ]; then
+		finish_test 1 "Strategy test stopped"
+	else
+		finish_test 0 "Strategy test finished"
+	fi
+}
+
+test_strategy() {
+	local strategy="$1" limit="$2" requests="$3"
+
+	start_test "$strategy" "$limit" "$requests" >/dev/null || return 1
+
+	while [ -d "$LOCK_DIR" ] && [ "$(lock_get finished 0)" != "1" ]; do
+		sleep 1
+	done
+
+	test_status
 }
 
 case "$1" in
@@ -443,14 +579,23 @@ case "$1" in
 	apply)
 		apply_strategy "$2" "$3"
 		;;
+	start-test)
+		start_test "$2" "$3" "$4"
+		;;
+	test-status)
+		test_status
+		;;
 	test-strategy)
 		test_strategy "$2" "$3" "$4"
+		;;
+	test-worker)
+		test_worker "$2" "$3" "$4"
 		;;
 	stop-test)
 		stop_test
 		;;
 	*)
-		echo "Usage: $HELPER_NAME status|list-strategies|diagnostics|service <start|stop|restart>|apply <strategy> <enabled>|test-strategy <strategy> [domains] [requests]|stop-test" >&2
+		echo "Usage: $HELPER_NAME status|list-strategies|diagnostics|service <start|stop|restart>|apply <strategy> <enabled>|start-test <strategy> [domains] [requests]|test-status|test-strategy <strategy> [domains] [requests]|stop-test" >&2
 		exit 1
 		;;
 esac
