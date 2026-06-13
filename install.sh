@@ -13,7 +13,6 @@ PODKOP_CONFIGURE="${PODKOP_CONFIGURE:-1}"
 PODKOP_SECTION="${PODKOP_SECTION:-byedpi}"
 PODKOP_PROXY_STRING="${PODKOP_PROXY_STRING:-socks5://127.0.0.1:1080#byedpi}"
 PODKOP_RESOLVE_REAL_IP="${PODKOP_RESOLVE_REAL_IP:-1}"
-PODKOP_BYEDPI_COMMUNITY_LISTS="${PODKOP_BYEDPI_COMMUNITY_LISTS:-youtube}"
 PODKOP_RESTART="${PODKOP_RESTART:-1}"
 STATE_DIR="/etc/luci-app-byedpi"
 STATE_FILE="$STATE_DIR/install.state"
@@ -241,7 +240,7 @@ ensure_byedpi() {
 }
 
 configure_podkop_byedpi() {
-	local list exists=0
+	local exists=0
 
 	[ "$PODKOP_CONFIGURE" = "1" ] || {
 		info "Skipping Podkop integration"
@@ -272,15 +271,6 @@ configure_podkop_byedpi() {
 	uci set "podkop.$PODKOP_SECTION.user_subnet_list_type=disabled"
 	uci set "podkop.$PODKOP_SECTION.mixed_proxy_enabled=0"
 	uci set "podkop.$PODKOP_SECTION.enable_udp_over_tcp=0"
-
-	if [ "$exists" = "0" ]; then
-		uci -q delete "podkop.$PODKOP_SECTION.community_lists" || true
-		if [ -n "$PODKOP_BYEDPI_COMMUNITY_LISTS" ] && [ "$PODKOP_BYEDPI_COMMUNITY_LISTS" != "none" ]; then
-			for list in $PODKOP_BYEDPI_COMMUNITY_LISTS; do
-				uci add_list "podkop.$PODKOP_SECTION.community_lists=$list"
-			done
-		fi
-	fi
 
 	uci commit podkop
 	[ "$exists" = "0" ] && set_state podkop_section_created_by_installer 1

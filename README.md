@@ -63,12 +63,11 @@ config section 'byedpi'
 	option proxy_config_type 'url'
 	option proxy_string 'socks5://127.0.0.1:1080#byedpi'
 	option resolve_real_ip_for_routing '1'
-	list community_lists 'youtube'
 ```
 
 Если `podkop.byedpi` уже существует, установщик обновляет только основные поля
-для прокси и диагностики. Списки `community_lists` у существующей секции не
-перезаписываются.
+для прокси и диагностики. Списки `community_lists` установщик не задает:
+пользователь выбирает их сам в Podkop.
 
 ## Опции установки
 
@@ -82,12 +81,6 @@ wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh
 
 ```sh
 wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | PODKOP_CONFIGURE=0 sh
-```
-
-Задать списки Podkop для новой секции:
-
-```sh
-wget -qO- https://raw.githubusercontent.com/moz9/luci-app-byedpi/main/install.sh | PODKOP_BYEDPI_COMMUNITY_LISTS="youtube google" sh
 ```
 
 Поставить из другой ветки или форка:
