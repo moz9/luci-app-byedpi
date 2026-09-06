@@ -16,6 +16,9 @@ let activeTab = "settings";
 let testing = false;
 let stopRequested = false;
 let lastProgressKey = "";
+let testStatusBusy = false;
+let lastTestReport = "";
+let settingsDirty = false;
 
 function injectStyles() {
 	if (document.getElementById("byedpi-luci-style"))
@@ -211,18 +214,8 @@ function normalizeStrategy(value) {
 	return (value || "").trim().replace(/\s+/g, " ");
 }
 
-function scorePercent(score) {
-	const parts = String(score || "").split("/");
-	const success = parseInt(parts[0], 10);
-	const total = parseInt(parts[1], 10);
-	return total > 0 ? success / total : -1;
-}
-
 function sortedStrategies() {
-	return strategies.slice().sort(function(a, b) {
-		const delta = scorePercent(b.score) - scorePercent(a.score);
-		return delta !== 0 ? delta : a.id - b.id;
-	});
+	return strategies.slice().sort(function(a, b) { return a.id - b.id; });
 }
 
 function getStrategyTextarea() {
@@ -238,8 +231,7 @@ function getPresetSelect(id) {
 }
 
 function optionLabel(item) {
-	const score = item.score ? item.score + " · " : "";
-	return "#" + item.id + " · " + score + item.value;
+	return "#" + item.id + " · " + item.value;
 }
 
 function renderStrategyOptions(selectedValue) {
@@ -289,10 +281,10 @@ function updateStatus() {
 		const strategy = getStrategyTextarea();
 		const enabled = getEnabledInput();
 
-		if (strategy && document.activeElement !== strategy)
+		if (strategy && !settingsDirty && document.activeElement !== strategy)
 			strategy.value = data.current_strategy || "";
 
-		if (enabled)
+		if (enabled && !settingsDirty)
 			enabled.checked = !!data.enabled;
 	}).catch(function(err) {
 		const node = document.getElementById(STATUS_NODE_ID);
@@ -355,263 +347,118 @@ function clearLog() {
 		node.textContent = "";
 }
 
-function delay(ms) {
-	return new Promise(function(resolve) {
-		window.setTimeout(resolve, ms);
+function setTestingState(isTesting) {
+	testing = !!isTesting;
+	[ "byedpi-auto-start", "byedpi-test-current", "byedpi-test-duration",
+	  "byedpi-save-restart", "byedpi-service-start", "byedpi-service-restart", "byedpi-service-stop" ].forEach(function(id) {
+		const node = document.getElementById(id);
+		if (node) node.disabled = testing;
 	});
+	const stop = document.getElementById("byedpi-test-stop");
+	if (stop) stop.disabled = !testing || stopRequested;
+}
+
+function currentStrategy() {
+	const input = getStrategyTextarea();
+	return normalizeStrategy(input ? input.value : "");
 }
 
 function renderTestProgress(status) {
 	const node = document.getElementById(TEST_PROGRESS_NODE_ID);
-	if (!node)
-		return;
-
+	if (!node) return;
+	const serialized = JSON.stringify(status || {});
+	if (serialized === lastTestReport && testing === !!(status && status.active && status.state === "running")) return;
+	lastTestReport = serialized;
 	if (!status || !status.active) {
-		node.replaceChildren(E("span", { class: "byedpi-muted" }, _("Тест не запущен")));
+		node.replaceChildren(E("span", { class: "byedpi-muted" }, _("Подбор ещё не запускался на этом роутере.")));
+		setTestingState(false);
 		return;
 	}
-
-	const tested = parseInt(status.tested, 10) || 0;
-	const totalDomains = parseInt(status.total_domains, 10) || 0;
-	const result = status.result || "0/0";
-	const current = status.current_domain || "";
-	const finished = !!status.finished;
-	const stopped = !!status.stopped;
-
-	let stateText = _("Идет тест");
-	let badgeClass = "warn";
-	if (finished && stopped) {
-		stateText = _("Остановлено");
-		badgeClass = "bad";
-	}
-	else if (finished) {
-		stateText = _("Готово");
-		badgeClass = "ok";
-	}
-
+	const running = status.state === "running";
+	if (!running) stopRequested = false;
+	setTestingState(running);
+	const duration = document.getElementById("byedpi-test-duration");
+	if (running && duration && status.duration_minutes) duration.value = String(status.duration_minutes);
+	const elapsed = Math.max(0, Math.floor(((status.checked_at || 0) - (status.started || 0)) / 60));
+	const stage = status.stage === "resolve" ? _("Подготовка адресов") : status.stage === "screen" ? _("Первичный отбор") : _("Повторная проверка");
+	const states = { complete: _("Завершено"), stopped: _("Остановлено"), interrupted: _("Прервано"), failed: _("Ошибка подготовки") };
+	const summary = running ? stage + " · " + elapsed + _(" мин с начала подбора") : (states[status.state] || status.state);
 	node.replaceChildren(E("div", { class: "byedpi-progress" }, [
-		E("div", { class: "byedpi-status-line" }, [
-			E("span", { class: "byedpi-badge " + badgeClass }, stateText),
-			E("span", {}, _("Домены: ") + tested + "/" + totalDomains),
-			E("span", {}, _("Итог: ") + result)
-		]),
-		current ? E("span", { class: "byedpi-muted" }, _("Сейчас: ") + current) : "",
-		status.message ? E("span", { class: "byedpi-muted" }, status.message) : ""
+		E("b", {}, summary),
+		E("span", {}, status.message || ""),
+		running && status.stage !== "resolve" ? E("span", { class: "byedpi-muted" }, status.stage === "screen"
+			? _("Стратегия ") + status.current_id + "/" + status.candidate_count
+			: _("Круг ") + status.round + _(" · стратегия ") + status.current_id) : "",
+		status.state === "complete" && !status.recommended_id ? E("span", { class: "byedpi-muted" }, _("Ни одна стратегия не прошла критерии стабильности. Автоматически применять здесь нечего.")) : ""
 	]));
-}
-
-function logProgress(status) {
-	const key = [
-		status && status.tested,
-		status && status.total_domains,
-		status && status.result,
-		status && status.current_domain,
-		status && status.finished,
-		status && status.stopped
-	].join("|");
-
-	if (key === lastProgressKey)
-		return;
-
-	lastProgressKey = key;
-
-	if (!status || !status.active)
-		return;
-
-	if (status.finished)
-		return;
-
-	logLine(_("Прогресс: ") + (status.tested || 0) + "/" + (status.total_domains || 0) + " · " + (status.result || "0/0") + (status.current_domain ? " · " + status.current_domain : ""));
-}
-
-function appendResult(result) {
 	const table = document.getElementById(RESULTS_NODE_ID);
-	if (!table)
-		return;
-
-	const tbody = table.querySelector("tbody");
-	const row = E("tr", {}, [
-		E("td", {}, result.strategy || ""),
-		E("td", {}, result.result || ""),
-		E("td", {}, (result.domains || []).map(function(item) {
-			return E("div", {}, [
-				E("span", { class: "byedpi-badge " + (item.success > 0 ? "ok" : "bad") }, item.success + "/" + item.total),
-				" ",
-				item.domain
-			]);
-		})),
-		E("td", { class: "actions" }, [
-			E("button", {
-				class: "btn cbi-button cbi-button-apply",
+	if (!table) return;
+	const body = table.querySelector("tbody");
+	body.replaceChildren.apply(body, (status.ranking || []).map(function(item) {
+		const recommended = String(item.id) === String(status.recommended_id);
+		return E("tr", {}, [
+			E("td", {}, [ E("b", {}, (recommended ? _("Рекомендуется · ") : "") + (item.id === 1 ? _("Текущая при запуске") : _("Кандидат ") + item.id)),
+				E("details", {}, [ E("summary", {}, _("Аргументы")), E("pre", { class: "byedpi-command" }, item.strategy) ]) ]),
+			E("td", {}, [ E("div", {}, _("Ошибок: ") + item.failed + "/" + item.total),
+				E("div", {}, _("Задержек ≥1,5 с: ") + item.slow), E("div", {}, _("Кругов: ") + item.rounds) ]),
+			E("td", {}, item.median_ms === 999999 ? "—" : [
+				E("div", {}, item.median_ms + _(" мс обычно")), E("div", {}, item.p95_ms + _(" мс в 95% запросов")),
+				E("div", {}, _("Разброс: ") + item.jitter_ms + _(" мс")) ]),
+			E("td", {}, item.min_rate ? (item.min_rate * 8 / 1000000).toFixed(1) + _(" Мбит/с") : "—"),
+			E("td", {}, E("button", {
+				class: "btn cbi-button" + (recommended ? " cbi-button-apply" : ""), disabled: running ? "disabled" : null,
 				click: function() {
 					const strategy = getStrategyTextarea();
-					if (strategy)
-						strategy.value = result.strategy || "";
+					if (strategy) strategy.value = item.strategy;
+					settingsDirty = true;
+					getPresetSelect().value = item.strategy;
 					setActiveTab("settings");
+					strategy.focus();
 				}
-			}, _("Вставить"))
-		])
-	]);
-
-	tbody.appendChild(row);
+			}, _("Выбрать")))
+		]);
+	}));
 }
 
-function selectedStrategy(selectId) {
-	const select = getPresetSelect(selectId);
-	return normalizeStrategy(select ? select.value : "");
-}
-
-function currentStrategy() {
-	const textarea = getStrategyTextarea();
-	return normalizeStrategy(textarea ? textarea.value : "");
-}
-
-function setButtonDisabled(id, disabled) {
-	const button = document.getElementById(id);
-	if (button)
-		button.disabled = !!disabled;
-}
-
-function setControlDisabled(id, disabled) {
-	const control = document.getElementById(id);
-	if (control)
-		control.disabled = !!disabled;
-}
-
-function setTestingState(isTesting) {
-	testing = !!isTesting;
-
-	[
-		"byedpi-test-selected",
-		"byedpi-test-current",
-		"byedpi-test-top",
-		"byedpi-test-all",
-		"byedpi-clear-results"
-	].forEach(function(id) {
-		setButtonDisabled(id, testing);
-	});
-
-	[
-		"byedpi-test-preset",
-		"byedpi-test-limit",
-		"byedpi-test-requests"
-	].forEach(function(id) {
-		setControlDisabled(id, testing);
-	});
-
-	setButtonDisabled("byedpi-test-stop", !testing || stopRequested);
-}
-
-async function waitForStrategyTest() {
-	while (testing) {
+async function refreshTestStatus() {
+	if (testStatusBusy) return;
+	testStatusBusy = true;
+	try {
 		const status = await execJson([ "test-status" ], 10000);
 		renderTestProgress(status);
-		logProgress(status);
-
-		if (status.finished)
-			return status;
-
-		await delay(1500);
-	}
-
-	return execJson([ "test-status" ], 10000);
-}
-
-function runStrategyTest(strategy) {
-	const limitInput = document.getElementById("byedpi-test-limit");
-	const requestsInput = document.getElementById("byedpi-test-requests");
-	const limit = limitInput ? limitInput.value : "8";
-	const requests = requestsInput ? requestsInput.value : "1";
-
-	if (!strategy) {
-		notify(_("Стратегия пустая"), "warning");
-		return Promise.resolve();
-	}
-
-	logLine(_("Тестирую: ") + strategy);
-	lastProgressKey = "";
-
-	return execJson([ "start-test", strategy, limit, requests ], 10000).then(function(status) {
-		renderTestProgress(status);
-		return waitForStrategyTest();
-	}).then(function(result) {
-		appendResult(result);
-		if (result.stopped)
-			logLine(_("Остановлено: ") + (result.result || "0/0") + " · " + strategy);
-		else
-			logLine((result.result || "0/0") + " · " + strategy);
-
-		return !result.stopped;
-	}).catch(function(err) {
-		if (stopRequested) {
-			logLine(_("Остановлено"));
-			return false;
+		const key = [ status.state, status.stage, status.current_id, status.round ].join("|");
+		if (status.active && key !== lastProgressKey) {
+			lastProgressKey = key;
+			logLine(status.message || "");
 		}
-
-		const message = err.message || err;
-		logLine(_("Ошибка: ") + message);
-		notify(message, "error");
-		return false;
-	}).finally(function() {
-		updateStatus();
-	});
+	} catch (err) {
+		// Keep the busy state on RPC failure: the background job may still run.
+		lastTestReport = "";
+		const node = document.getElementById(TEST_PROGRESS_NODE_ID);
+		if (node) node.replaceChildren(E("span", {}, _("Не удалось обновить состояние: ") + err.message));
+	} finally { testStatusBusy = false; }
 }
 
-async function runStrategyQueue(items) {
-	if (testing)
-		return;
-
-	const queue = items.map(function(item) {
-		return normalizeStrategy(item && item.value ? item.value : item);
-	}).filter(function(item) {
-		return !!item;
-	});
-
-	if (!queue.length) {
-		notify(_("Нет стратегий для теста"), "warning");
-		return;
-	}
-
-	clearLog();
-	renderTestProgress(null);
-	stopRequested = false;
-	setTestingState(true);
-
+async function startTests(mode) {
+	if (testing) return;
+	const strategy = currentStrategy();
+	if (!strategy) { notify(_("Сначала укажите текущую стратегию."), "warning"); return; }
+	const duration = document.getElementById("byedpi-test-duration");
+	const args = mode === "auto" ? [ "start-autotest", strategy, duration ? duration.value : "15" ] : [ "start-test", strategy ];
+	clearLog(); stopRequested = false; setTestingState(true);
 	try {
-		for (let i = 0; i < queue.length; i++) {
-			if (stopRequested)
-				break;
-
-			const keepGoing = await runStrategyTest(queue[i]);
-			if (!keepGoing)
-				break;
-		}
-
-		if (stopRequested)
-			logLine(_("Тесты остановлены"));
-	}
-	finally {
-		stopRequested = false;
-		setTestingState(false);
-		updateStatus();
+		renderTestProgress(await execJson(args, 15000));
+	} catch (err) {
+		notify(err.message || err, "error");
+		await refreshTestStatus();
 	}
 }
 
-function stopTests() {
-	if (!testing || stopRequested)
-		return Promise.resolve();
-
-	stopRequested = true;
-	setTestingState(true);
-	logLine(_("Останавливаю тесты..."));
-
-	return execJson([ "stop-test" ], 10000).then(renderTestProgress).catch(function(err) {
-		const message = err.message || err;
-		logLine(_("Ошибка остановки: ") + message);
-		notify(message, "error");
-		stopRequested = false;
-		setTestingState(true);
-	}).finally(updateStatus);
+async function stopTests() {
+	if (!testing || stopRequested) return;
+	stopRequested = true; setTestingState(true);
+	try { renderTestProgress(await execJson([ "stop-test" ], 10000)); }
+	catch (err) { stopRequested = false; setTestingState(true); notify(err.message, "error"); }
 }
 
 function saveAndRestart(strategy, enabled) {
@@ -623,6 +470,7 @@ function saveAndRestart(strategy, enabled) {
 	}
 
 	return execJson([ "apply", strategy, enabled ? "1" : "0" ], 30000).then(function(data) {
+		settingsDirty = false;
 		notify(_("Настройки сохранены"), "info");
 		renderStatus(data);
 	}).catch(function(err) {
@@ -651,60 +499,21 @@ function bindHandlers() {
 			const textarea = getStrategyTextarea();
 			if (textarea)
 				textarea.value = preset.value;
+			settingsDirty = true;
 		});
 
-	const testPreset = getPresetSelect("byedpi-test-preset");
-	if (testPreset)
-		testPreset.addEventListener("change", function() {
-			logLine(_("Выбрана стратегия: ") + testPreset.value);
-		});
+	getStrategyTextarea().addEventListener("input", function() { settingsDirty = true; });
+	getEnabledInput().addEventListener("change", function() { settingsDirty = true; });
 
 	const saveButton = document.getElementById("byedpi-save-restart");
-	if (saveButton)
-		saveButton.addEventListener("click", function() {
-			saveAndRestart(currentStrategy(), getEnabledInput() ? getEnabledInput().checked : true);
-		});
-
-	const refreshDiagnosticsButton = document.getElementById("byedpi-refresh-diagnostics");
-	if (refreshDiagnosticsButton)
-		refreshDiagnosticsButton.addEventListener("click", refreshDiagnostics);
-
-	const testSelectedButton = document.getElementById("byedpi-test-selected");
-	if (testSelectedButton)
-		testSelectedButton.addEventListener("click", function() {
-			runStrategyQueue([ selectedStrategy("byedpi-test-preset") ]);
-		});
-
-	const testCurrentButton = document.getElementById("byedpi-test-current");
-	if (testCurrentButton)
-		testCurrentButton.addEventListener("click", function() {
-			runStrategyQueue([ currentStrategy() ]);
-		});
-
-	const testTopButton = document.getElementById("byedpi-test-top");
-	if (testTopButton)
-		testTopButton.addEventListener("click", function() {
-			runStrategyQueue(sortedStrategies().slice(0, 10));
-		});
-
-	const testAllButton = document.getElementById("byedpi-test-all");
-	if (testAllButton)
-		testAllButton.addEventListener("click", function() {
-			runStrategyQueue(sortedStrategies());
-		});
-
-	const testStopButton = document.getElementById("byedpi-test-stop");
-	if (testStopButton)
-		testStopButton.addEventListener("click", stopTests);
-
-	const clearResultsButton = document.getElementById("byedpi-clear-results");
-	if (clearResultsButton)
-		clearResultsButton.addEventListener("click", function() {
-			const tbody = document.querySelector("#" + RESULTS_NODE_ID + " tbody");
-			if (tbody)
-				tbody.replaceChildren();
-			clearLog();
-		});
+	if (saveButton) saveButton.addEventListener("click", function() {
+		saveAndRestart(currentStrategy(), getEnabledInput().checked);
+	});
+	const diagnosticsButton = document.getElementById("byedpi-refresh-diagnostics");
+	if (diagnosticsButton) diagnosticsButton.addEventListener("click", refreshDiagnostics);
+	document.getElementById("byedpi-auto-start").addEventListener("click", function() { startTests("auto"); });
+	document.getElementById("byedpi-test-current").addEventListener("click", function() { startTests("single"); });
+	document.getElementById("byedpi-test-stop").addEventListener("click", stopTests);
 
 	[ "start", "restart", "stop" ].forEach(function(action) {
 		const button = document.getElementById("byedpi-service-" + action);
@@ -762,64 +571,49 @@ function renderDiagnosticsTab() {
 	]);
 }
 
-function renderTesterTab(status) {
-	const current = status.current_strategy || "";
-
+function renderTesterTab() {
 	return E("div", { class: "byedpi-tab", "data-tab": "tester" }, [
 		E("div", { class: "byedpi-panel" }, [
-			E("h3", {}, _("Тестер стратегий")),
-			E("div", { class: "byedpi-row" }, [
-				E("label", { for: "byedpi-test-preset" }, _("Стратегия для теста")),
-				E("select", { id: "byedpi-test-preset" }, renderStrategyOptions(current))
-			]),
-			E("div", { class: "byedpi-inline" }, [
-				E("label", {}, [
-					_("Доменов: "),
-					E("input", { id: "byedpi-test-limit", type: "number", min: "1", max: "32", value: "8" })
-				]),
-				E("label", {}, [
-					_("Запросов на домен: "),
-					E("input", { id: "byedpi-test-requests", type: "number", min: "1", max: "5", value: "1" })
+			E("h3", {}, _("Подбор стабильной стратегии")),
+			E("p", {}, _("Сначала проверяются все стратегии и текущая настройка. Затем до трёх лучших кандидатов проходят повторные проверки по очереди. Рабочий ByeDPI продолжает работать.")),
+			E("p", { class: "byedpi-muted" }, _("Рейтинг строится на этом роутере через его провайдера. Результаты других роутеров не используются.")),
+			E("label", { class: "byedpi-inline" }, [ _("Повторная проверка после отбора: "),
+				E("select", { id: "byedpi-test-duration" }, [
+					E("option", { value: "5" }, _("5 минут — быстрая")),
+					E("option", { value: "15", selected: "selected" }, _("15 минут — обычная")),
+					E("option", { value: "60" }, _("60 минут — длительная"))
 				])
 			]),
 			E("div", { class: "byedpi-inline" }, [
-				E("button", { id: "byedpi-test-selected", class: "btn cbi-button cbi-button-apply" }, _("Тестировать выбранную")),
-				E("button", { id: "byedpi-test-current", class: "btn cbi-button cbi-button-reload" }, _("Тестировать текущую")),
-				E("button", { id: "byedpi-test-top", class: "btn cbi-button" }, _("Тестировать топ-10")),
-				E("button", { id: "byedpi-test-all", class: "btn cbi-button" }, _("Тестировать все")),
-				E("button", { id: "byedpi-test-stop", class: "btn cbi-button cbi-button-remove", disabled: "disabled" }, _("Стоп")),
-				E("button", { id: "byedpi-clear-results", class: "btn cbi-button" }, _("Очистить"))
+				E("button", { id: "byedpi-auto-start", class: "btn cbi-button cbi-button-apply" }, _("Подобрать стратегию")),
+				E("button", { id: "byedpi-test-current", class: "btn cbi-button" }, _("Проверить текущую · 5 минут")),
+				E("button", { id: "byedpi-test-stop", class: "btn cbi-button cbi-button-remove", disabled: "disabled" }, _("Остановить"))
 			]),
-			E("div", { id: TEST_PROGRESS_NODE_ID }, E("span", { class: "byedpi-muted" }, _("Тест не запущен"))),
-			E("p", { class: "byedpi-muted" }, _("Во время теста ByeDPI временно перезапускается с проверяемой стратегией, затем возвращается прежняя стратегия."))
+			E("div", { id: TEST_PROGRESS_NODE_ID }),
+			E("p", { class: "byedpi-muted" }, _("Подбор продолжается при закрытии страницы. Выбор результата переносит аргументы в настройки; сохранение перезапустит рабочий ByeDPI.")),
+			E("p", { class: "byedpi-muted" }, _("Проверяются ответы YouTube и Google и загрузка тестовых данных Cloudflare (до 24 МБ плюс служебный трафик). Это проверка HTTPS через прокси; просмотр видео и маршрут Podkop нужно дополнительно проверить на устройстве."))
 		]),
-		E("div", { class: "byedpi-grid" }, [
-			E("div", { class: "byedpi-panel" }, [
-				E("h3", {}, _("Результаты")),
-				E("table", { id: RESULTS_NODE_ID, class: "byedpi-table" }, [
-					E("thead", {}, E("tr", {}, [
-						E("th", {}, _("Стратегия")),
-						E("th", {}, _("Итог")),
-						E("th", {}, _("Домены")),
-						E("th", {}, "")
-					])),
-					E("tbody", {})
-				])
-			]),
-			E("div", { class: "byedpi-panel" }, [
-				E("h3", {}, _("Лог")),
-				E("pre", { id: LOG_NODE_ID, class: "byedpi-log" }, "")
+		E("div", { class: "byedpi-panel", style: "overflow-x:auto" }, [
+			E("h3", {}, _("Результаты этого запуска")),
+			E("table", { id: RESULTS_NODE_ID, class: "byedpi-table" }, [
+				E("thead", {}, E("tr", {}, [ _("Стратегия"), _("Надёжность"), _("Задержка HTTPS"), _("Мин. скорость загрузки"), "" ].map(function(t) { return E("th", {}, t); }))),
+				E("tbody", {})
 			])
-		])
+		]),
+		E("details", { class: "byedpi-panel" }, [ E("summary", {}, _("Ход проверки")), E("pre", { id: LOG_NODE_ID, class: "byedpi-log" }, "") ])
 	]);
 }
 
 return view.extend({
+	handleSaveApply: null,
+	handleSave: null,
+	handleReset: null,
 	load: function() {
 		return Promise.all([
 			execJson([ "list-strategies" ], 15000),
 			execJson([ "status" ], 10000),
-			execJson([ "diagnostics" ], 20000).catch(function() { return { checks: [] }; })
+			execJson([ "diagnostics" ], 20000).catch(function() { return { checks: [] }; }),
+			execJson([ "test-status" ], 10000).catch(function() { return { active: false }; })
 		]);
 	},
 
@@ -831,11 +625,11 @@ return view.extend({
 		const diagnostics = data[2] || { checks: [] };
 
 		const page = E("div", { class: "byedpi-page" }, [
-			E("h2", {}, _("Настройки ByeDPI")),
+			E("h2", {}, [ _("Настройки ByeDPI"), E("small", { class: "byedpi-muted", style: "margin-left:12px;font-size:13px" }, "0.2.0") ]),
 			E("div", { class: "byedpi-tabs" }, [
 				E("button", { class: "btn cbi-button active", "data-tab": "settings" }, _("Настройки")),
 				E("button", { class: "btn cbi-button", "data-tab": "diagnostics" }, _("Диагностика")),
-				E("button", { class: "btn cbi-button", "data-tab": "tester" }, _("Тестер"))
+				E("button", { class: "btn cbi-button", "data-tab": "tester" }, _("Автоподбор"))
 			]),
 			renderSettings(status),
 			renderDiagnosticsTab(),
@@ -846,8 +640,10 @@ return view.extend({
 			bindHandlers();
 			renderStatus(status);
 			renderDiagnostics(diagnostics);
+			renderTestProgress(data[3]);
 			setActiveTab(activeTab);
 			poll.add(updateStatus);
+			poll.add(refreshTestStatus, 3);
 		}, 0);
 
 		return page;

@@ -51,7 +51,18 @@ restore_byedpi_service_state() {
 }
 
 info "Removing luci-app-byedpi files"
+if [ -x /usr/libexec/byedpi-luci-test ] && [ -d /tmp/byedpi-luci-test-v2 ]; then
+	/usr/libexec/byedpi-luci-test stop >/dev/null 2>&1 || true
+	# A probe is bounded by eight seconds; keep the worker available to clean up.
+	tries=0
+	while [ "$(cat /tmp/byedpi-luci-test-v2/state 2>/dev/null)" = running ]; do
+		tries=$((tries + 1))
+		[ "$tries" -le 15 ] || { echo "Stop the strategy test before uninstalling." >&2; exit 1; }
+		sleep 1
+	done
+fi
 rm -f /usr/libexec/byedpi-luci
+rm -f /usr/libexec/byedpi-luci-test
 rm -f /usr/share/luci/menu.d/luci-app-byedpi.json
 rm -f /usr/share/rpcd/acl.d/luci-app-byedpi.json
 rm -f /etc/uci-defaults/50_luci-byedpi

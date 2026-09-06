@@ -1,0 +1,364 @@
+#!/bin/sh
+# Background, sequential probes. Never edits UCI or restarts the live service.
+DATA_DIR="/usr/share/byedpi-luci"
+WORK="/tmp/byedpi-luci-test-v2"
+CIADPI="/usr/bin/ciadpi"
+active_slot=screen
+. /usr/share/libubox/jshn.sh
+
+put() { printf '%s\n' "$2" > "$WORK/$1.tmp"; mv "$WORK/$1.tmp" "$WORK/$1"; }
+get() { cat "$WORK/$1" 2>/dev/null || true; }
+stopping() { [ -f "$WORK/stop" ]; }
+pid_stamp() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
+owned_alive() {
+    [ -n "$1" ] && [ -n "$2" ] && kill -0 "$1" 2>/dev/null &&
+        [ "$(pid_stamp "$1")" = "$2" ]
+}
+stop_proxy() {
+    if owned_alive "$(get proxy_pid_$active_slot)" "$(get proxy_stamp_$active_slot)"; then
+        kill "$(get proxy_pid_$active_slot)" 2>/dev/null || true
+        wait "$(get proxy_pid_$active_slot)" 2>/dev/null || true
+    fi
+    rm -f "$WORK/proxy_pid_$active_slot" "$WORK/proxy_stamp_$active_slot" "$WORK/proxy_port_$active_slot"
+}
+stop_all_proxies() {
+    local file
+    for file in "$WORK"/proxy_pid_*; do
+        [ -f "$file" ] || continue
+        active_slot="$(basename "$file" | sed 's/^proxy_pid_//')"
+        stop_proxy
+    done
+}
+
+# Word splitting matches the OpenWrt service's cmd_opts contract; never eval.
+# Listener, daemon and output-file flags belong to the isolated worker.
+prepare_strategy() (
+    local strategy="$1" word skip=0 result="" name
+    case "$strategy" in
+        *\"*|*\'*|*\`*|*\$*|*\\*|*'
+'*) echo "Для теста используйте аргументы без shell-кавычек и подстановок" >&2; return 1 ;;
+    esac
+    set -f
+    for word in $strategy; do
+        if [ "$skip" = 1 ]; then skip=0; continue; fi
+        case "$word" in
+            -i|-p|-w|-y|--ip|--port|--pidfile|--cache-dump) skip=1 ;;
+            -i?*|-p?*|-w?*|-y?*|--ip=*|--port=*|--pidfile=*|--cache-dump=*|-D|--daemon) ;;
+            -E|--transparent|--|-h|--help|-v|--version|-[DFESUNY]?*) return 1 ;;
+            --*)
+                name="$(printf '%s' "$word" | cut -d = -f1)"
+                case "$name" in
+                    --max-conn|--conn-ip|--buf-size|--def-ttl|--no-domain|--no-udp|--tfo|--auto|--auto-mode|--cache-ttl|--timeout|--proto|--hosts|--ipset|--pf|--round|--split|--disorder|--oob|--disoob|--fake|--ttl|--md5sig|--fake-offset|--fake-data|--oob-data|--fake-sni|--fake-tls-mod|--mod-http|--tlsrec|--tlsminor|--udp-fake|--drop-sack)
+                        result="$result $word" ;;
+                    *) return 1 ;;
+                esac ;;
+            *) result="$result $word" ;;
+        esac
+    done
+    [ "$skip" = 0 ] || return 1
+    printf '%s\n' "$result" | sed 's/^ //'
+)
+
+start_proxy() {
+    local strategy="$1" normalized port
+    stop_proxy
+    normalized="$(prepare_strategy "$strategy")" || return 1
+    proxy_port=""
+    for port in 2080 2081 2082 2083 2084 2085 2086 2087 2088 2089; do
+        if ! netstat -lnt 2>/dev/null | awk -v p=":$port" '$4 ~ p "$" { found=1 } END { exit !found }'; then
+            proxy_port="$port"; break
+        fi
+    done
+    [ -n "$proxy_port" ] || return 1
+    set -f
+    # Intentional splitting; no shell syntax is executed.
+    set -- $normalized
+    set +f
+    "$CIADPI" "$@" -i 127.0.0.1 -p "$proxy_port" -c 32 >"$WORK/proxy_$active_slot.log" 2>&1 &
+    put "proxy_pid_$active_slot" "$!"
+    put "proxy_stamp_$active_slot" "$(pid_stamp "$(get proxy_pid_$active_slot)")"
+    put "proxy_port_$active_slot" "$proxy_port"
+    sleep 1
+    owned_alive "$(get proxy_pid_$active_slot)" "$(get proxy_stamp_$active_slot)" || return 1
+    stopping && { stop_proxy; return 1; }
+    return 0
+}
+
+real_ipv4() {
+    printf '%s\n' "$1" | awk -F . '
+        NF != 4 { exit 1 }
+        { for (i=1; i<=4; i++) if ($i !~ /^[0-9]+$/ || length($i)>3 || $i+0>255 || (length($i)>1 && substr($i,1,1)=="0")) exit 1 }
+        $1==0 || $1==10 || $1==127 || $1>=224 { exit 1 }
+        $1==100 && $2>=64 && $2<=127 { exit 1 }
+        $1==169 && $2==254 { exit 1 }
+        $1==172 && $2>=16 && $2<=31 { exit 1 }
+        $1==192 && ($2==168 || ($2==0 && ($3==0 || $3==2))) { exit 1 }
+        $1==198 && ($2==18 || $2==19 || ($2==51 && $3==100)) { exit 1 }
+        $1==203 && $2==0 && $3==113 { exit 1 }
+    '
+}
+
+resolve_targets() {
+    local host provider endpoint pin response ip selected
+    : > "$WORK/targets.tmp"
+    # DNS from dnsmasq may be Podkop FakeIP. Resolve outside that path over
+    # verified HTTPS, then pin the same real address for every candidate.
+    for host in www.youtube.com www.gstatic.com speed.cloudflare.com; do
+        selected=""
+        for provider in google cloudflare; do
+            stopping && return 1
+            case "$provider" in
+                google) endpoint="https://dns.google/resolve"; pin="dns.google:443:8.8.8.8" ;;
+                cloudflare) endpoint="https://cloudflare-dns.com/dns-query"; pin="cloudflare-dns.com:443:1.1.1.1" ;;
+            esac
+            response="$(curl --silent --show-error --fail --ipv4 --noproxy '*' \
+                --resolve "$pin" --connect-timeout 4 --max-time 8 --max-filesize 65536 \
+                --header 'accept: application/dns-json' "$endpoint?name=$host&type=A" 2>"$WORK/dns.log")" || continue
+            for ip in $(printf '%s' "$response" | jsonfilter -e '@.Answer[*].data' 2>/dev/null); do
+                if real_ipv4 "$ip"; then selected="$ip"; break; fi
+            done
+            [ -z "$selected" ] || break
+        done
+        [ -n "$selected" ] || return 1
+        printf '%s|%s\n' "$host" "$selected" >> "$WORK/targets.tmp"
+    done
+    mv "$WORK/targets.tmp" "$WORK/targets"
+}
+
+probe() {
+    local id="$1" stage="$2" round="$3" kind="$4"
+    local url method host target_ip result rc=0 code seconds bytes rate ok=0 ms
+    stopping && return 1
+    case "$kind" in
+        youtube) host="www.youtube.com"; url="https://www.youtube.com/"; method="--head" ;;
+        google) host="www.gstatic.com"; url="https://www.gstatic.com/generate_204"; method="--head" ;;
+        download) host="speed.cloudflare.com"; url="https://speed.cloudflare.com/__down?bytes=1048576"; method="" ;;
+        *) return 1 ;;
+    esac
+    target_ip="$(awk -F '|' -v host="$host" '$1==host {print $2; exit}' "$WORK/targets" 2>/dev/null)"
+    if ! real_ipv4 "$target_ip"; then
+        printf '%s|%s|%s|%s|0|0|0|0\n' "$id" "$stage" "$round" "$kind" >> "$WORK/samples"
+        return 0
+    fi
+    # A real IP prevents FakeIP from sending this test through the live proxy.
+    # Do not follow redirects to an unpinned host. SNI and TLS use the URL host.
+    # No retries: a failed attempt must remain visible in the score.
+    result="$(curl --silent --show-error --fail --ipv4 --resolve "$host:443:$target_ip" $method \
+        --socks5 "127.0.0.1:$proxy_port" --noproxy "" --connect-timeout 4 --max-time 8 \
+        --max-filesize 1048576 --output /dev/null \
+        --write-out '%{http_code}|%{time_total}|%{size_download}|%{speed_download}' \
+        "$url" 2>"$WORK/curl.log")" || rc="$?"
+    code="$(printf '%s' "$result" | cut -d '|' -f1)"
+    seconds="$(printf '%s' "$result" | cut -d '|' -f2)"
+    bytes="$(printf '%s' "$result" | cut -d '|' -f3)"
+    rate="$(printf '%s' "$result" | cut -d '|' -f4)"
+    ms="$(awk -v s="$seconds" 'BEGIN { printf "%.0f", s * 1000 }')"
+    bytes="$(awk -v n="$bytes" 'BEGIN { printf "%.0f", n }')"
+    rate="$(awk -v n="$rate" 'BEGIN { printf "%.0f", n }')"
+    if [ "$rc" = 0 ]; then
+        case "$kind:$code" in youtube:200|google:204) ok=1 ;;
+            download:200) [ "$bytes" -eq 1048576 ] && ok=1 ;;
+        esac
+    fi
+    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$id" "$stage" "$round" "$kind" "$ok" "$ms" "$bytes" "$rate" >> "$WORK/samples"
+}
+
+score() { awk -v stage="$1" -f "$DATA_DIR/score.awk" "$WORK/samples"; }
+snapshot() {
+    local stage id total failed slow median p95 jitter rate rounds eligible strategy recommended=""
+    stage="$(get stage)"
+    score "$stage" > "$WORK/ranking.tmp"
+    mv "$WORK/ranking.tmp" "$WORK/ranking"
+    if [ "$(get state)" = complete ] && [ "$stage" = stable ]; then
+        recommended="$(awk -F '|' '$10 == 1 { print $1; exit }' "$WORK/ranking")"
+    fi
+    json_init
+    json_add_boolean active 1
+    json_add_string state "$(get state)"
+    json_add_string stage "$stage"
+    json_add_string message "$(get message)"
+    json_add_int started "$(get started)"
+    json_add_int checked_at "$(date +%s)"
+    json_add_int duration_minutes "$(get minutes)"
+    json_add_int candidate_count "$(wc -l < "$WORK/candidates")"
+    json_add_int current_id "$(get current_id)"
+    json_add_int round "$(get round)"
+    json_add_string recommended_id "$recommended"
+    json_add_array ranking
+    while IFS='|' read -r id total failed slow median p95 jitter rate rounds eligible; do
+        [ -n "$id" ] || continue
+        strategy="$(sed -n "${id}p" "$WORK/candidates")"
+        json_add_object
+        json_add_int id "$id"
+        json_add_string strategy "$strategy"
+        json_add_int total "$total"
+        json_add_int failed "$failed"
+        json_add_int slow "$slow"
+        json_add_int median_ms "$median"
+        json_add_int p95_ms "$p95"
+        json_add_int jitter_ms "$jitter"
+        json_add_int min_rate "$rate"
+        json_add_int rounds "$rounds"
+        json_add_boolean eligible "$eligible"
+        json_close_object
+    done < "$WORK/ranking"
+    json_close_array
+    json_dump > "$WORK/status.tmp"
+    mv "$WORK/status.tmp" "$WORK/status.json"
+}
+
+finish() {
+    stop_all_proxies
+    put state "$1"
+    put message "$2"
+    snapshot
+}
+cancel() { finish stopped "Подбор остановлен. Рабочая стратегия сохранена."; exit 0; }
+check_stop() { stopping && cancel; return 0; }
+rest() {
+    local left="$1"
+    while [ "$left" -gt 0 ]; do
+        check_stop
+        sleep 1
+        left=$((left - 1))
+    done
+}
+run_candidate() {
+    local id="$1" stage="$2" round="$3" pass=1 count=1 strategy crashed=0
+    check_stop
+    put current_id "$id"
+    put round "$round"
+    strategy="$(sed -n "${id}p" "$WORK/candidates")"
+    put message "Проверяется стратегия $id"
+    snapshot
+    active_slot=screen
+    [ "$stage" = stable ] && active_slot="$id"
+    if owned_alive "$(get proxy_pid_$active_slot)" "$(get proxy_stamp_$active_slot)"; then
+        proxy_port="$(get proxy_port_$active_slot)"
+    else
+        if [ "$stage" = stable ] && [ -f "$WORK/proxy_pid_$active_slot" ]; then
+            crashed=1
+            printf '%s|%s|%s|start|0|0|0|0\n' "$id" "$stage" "$round" >> "$WORK/samples"
+        fi
+        if ! start_proxy "$strategy"; then
+            check_stop
+            [ "$crashed" = 1 ] || printf '%s|%s|%s|start|0|0|0|0\n' "$id" "$stage" "$round" >> "$WORK/samples"
+            snapshot
+            return 0
+        fi
+    fi
+    [ "$stage" = stable ] && count=2
+    while [ "$pass" -le "$count" ]; do
+        probe "$id" "$stage" "$round" youtube
+        check_stop
+        probe "$id" "$stage" "$round" google
+        check_stop
+        pass=$((pass + 1))
+    done
+    # At most 8 MiB per finalist and 3 finalists. HEAD probes have no body.
+    if [ "$stage" = stable ] && [ "$round" -le 8 ]; then
+        probe "$id" "$stage" "$round" download
+    fi
+    [ "$stage" = screen ] && stop_proxy
+    snapshot
+}
+worker() {
+    local id=0 strategy mode minutes end round=0 count offset order started
+    trap '' HUP
+    trap cancel INT TERM
+    trap stop_all_proxies 0
+    mode="$(get mode)"; minutes="$(get minutes)"
+    put state running
+    put stage resolve
+    put message "Получение реальных адресов тестовых сайтов"
+    snapshot
+    if ! resolve_targets; then
+        check_stop
+        finish failed "Не удалось получить реальные адреса через защищённый DNS. Подбор не выполнялся."
+        return
+    fi
+    put stage screen
+    snapshot
+    while IFS= read -r strategy; do
+        id=$((id + 1))
+        run_candidate "$id" screen 0
+    done < "$WORK/candidates"
+    if [ "$mode" = single ]; then
+        printf '1\n' > "$WORK/finalists"
+    else
+        # A partial success may enter retesting; full qualification is stricter.
+        score screen | awk -F '|' '$2 > $3 { print $1; n++; if (n == 3) exit }' > "$WORK/finalists"
+        # Always compare the current strategy if it passed at least one probe.
+        if score screen | awk -F '|' '$1 == 1 && $2 > $3 { ok=1 } END { exit !ok }'; then
+            if ! grep -qx 1 "$WORK/finalists"; then
+                { head -n 2 "$WORK/finalists"; printf '1\n'; } > "$WORK/finalists.tmp"
+                mv "$WORK/finalists.tmp" "$WORK/finalists"
+            fi
+        fi
+    fi
+    [ -s "$WORK/finalists" ] || { finish complete "Рабочие кандидаты не найдены. Проверьте DNS, доступ и ошибки HTTPS."; return; }
+    count="$(wc -l < "$WORK/finalists")"
+    put stage stable
+    end=$(($(date +%s) + minutes * 60))
+    # Complete equal rounds; never compare a partial round as final evidence.
+    while [ "$(date +%s)" -lt "$end" ]; do
+        round=$((round + 1))
+        started="$(date +%s)"
+        offset=$(((round - 1) % count))
+        order="$(awk -v o="$offset" '{a[NR]=$0} END {for(i=1;i<=NR;i++) print a[(i+o-1)%NR+1]}' "$WORK/finalists")"
+        for id in $order; do run_candidate "$id" stable "$round"; done
+        if [ "$(date +%s)" -lt "$end" ]; then rest 30; fi
+    done
+    check_stop
+    finish complete "Проверка завершена. Результат относится к этому запуску; применение — отдельной кнопкой."
+}
+
+start() {
+    local mode="$1" current="$2" minutes="$3"
+    case "$mode" in auto|single) ;; *) return 1 ;; esac
+    case "$minutes" in 5|15|60) ;; *) return 1 ;; esac
+    command -v curl >/dev/null 2>&1 && command -v netstat >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1 &&
+        [ -x "$CIADPI" ] || { echo "Для подбора нужны ciadpi, curl и netstat" >&2; return 1; }
+    prepare_strategy "$current" >/dev/null || { echo "Текущие аргументы не подходят для изолированного теста" >&2; return 1; }
+    mkdir "$WORK.start" 2>/dev/null || { echo "Подбор уже запускается" >&2; return 1; }
+    if owned_alive "$(get worker_pid)" "$(get worker_stamp)"; then
+        rmdir "$WORK.start"; echo "Подбор уже выполняется" >&2; return 1
+    fi
+    umask 077
+    mkdir -p "$WORK"
+    stop_all_proxies
+    rm -f "$WORK/stop"
+    : > "$WORK/samples"
+    {
+        printf '%s\n' "$current"
+        [ "$mode" = auto ] && sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$DATA_DIR/strategies.txt"
+    } | awk 'NF && !seen[$0]++ {print; n++; if(n==64) exit}' > "$WORK/candidates"
+    [ -s "$WORK/candidates" ] || { rmdir "$WORK.start"; return 1; }
+    put mode "$mode"; put minutes "$minutes"; put started "$(date +%s)"
+    put current_id 0; put round 0; put state running; put stage resolve
+    put message "Получение реальных адресов тестовых сайтов"
+    snapshot
+    sh "$0" worker </dev/null >"$WORK/worker.log" 2>&1 &
+    put worker_pid "$!"
+    put worker_stamp "$(pid_stamp "$(get worker_pid)")"
+    rmdir "$WORK.start"
+    status
+}
+status() {
+    if [ ! -f "$WORK/status.json" ]; then printf '{"active":false}\n'; return; fi
+    if [ "$(get state)" = running ] && ! owned_alive "$(get worker_pid)" "$(get worker_stamp)" &&
+        [ ! -d "$WORK.start" ]; then
+        # Only terminate an orphan with the recorded /proc identity.
+        finish interrupted "Проверка прервана. Рекомендация не сформирована."
+    fi
+    cat "$WORK/status.json"
+}
+
+# Dispatch
+case "$1" in
+    start) start "$2" "$3" "$4" ;;
+    worker) worker ;;
+    status) status ;;
+    stop) [ -d "$WORK" ] && touch "$WORK/stop"; status ;;
+    *) echo "Usage: byedpi-luci-test start <auto|single> <strategy> <5|15|60>|status|stop" >&2; exit 1 ;;
+esac

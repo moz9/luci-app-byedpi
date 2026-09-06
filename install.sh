@@ -7,7 +7,7 @@ REPO_URL="${REPO_URL:-https://github.com/moz9/luci-app-byedpi}"
 REF="${REF:-main}"
 ARCHIVE_URL="${ARCHIVE_URL:-${REPO_URL%/}/archive/refs/heads/${REF}.tar.gz}"
 BYEDPI_AUTO_INSTALL="${BYEDPI_AUTO_INSTALL:-1}"
-BYEDPI_START="${BYEDPI_START:-1}"
+BYEDPI_START="${BYEDPI_START:-auto}"
 BYEDPI_RELEASE_API="${BYEDPI_RELEASE_API:-https://api.github.com/repos/DPITrickster/ByeDPI-OpenWrt/releases/latest}"
 PODKOP_CONFIGURE="${PODKOP_CONFIGURE:-1}"
 PODKOP_SECTION="${PODKOP_SECTION:-byedpi}"
@@ -17,6 +17,26 @@ PODKOP_RESTART="${PODKOP_RESTART:-1}"
 STATE_DIR="/etc/luci-app-byedpi"
 STATE_FILE="$STATE_DIR/install.state"
 WORK_DIR="${TMPDIR:-/tmp}/${APP_NAME}.$$"
+MUTATING=0
+COMPLETE=0
+PODKOP_CHANGED=0
+SERVICE_CHANGED=0
+INSTALL_LOCKED=0
+TEST_START_LOCK="/tmp/byedpi-luci-test-v2.start"
+INSTALL_PATHS="/etc/config/byedpi
+/etc/config/podkop
+/etc/luci-app-byedpi/install.state
+/etc/uci-defaults/50_luci-byedpi
+/usr/libexec/byedpi-luci
+/usr/libexec/byedpi-luci-test
+/usr/share/luci/menu.d/luci-app-byedpi.json
+/usr/share/rpcd/acl.d/luci-app-byedpi.json
+/usr/share/byedpi-luci/strategies.txt
+/usr/share/byedpi-luci/domains.txt
+/usr/share/byedpi-luci/proxytest.results
+/usr/share/byedpi-luci/score.awk
+/www/luci-static/resources/view/byedpi/main.js
+/www/luci-static/resources/view/byedpi/byedpi.js"
 
 die() {
 	echo "ERROR: $*" >&2
@@ -35,16 +55,78 @@ download() {
 	local url="$1" target="$2"
 
 	if have curl; then
-		curl -fsSL "$url" -o "$target"
+		curl -fsSL --connect-timeout 15 --max-time 120 "$url" -o "$target"
 	elif have wget; then
-		wget -qO "$target" "$url"
+		wget -T 30 -qO "$target" "$url"
 	else
 		die "curl or wget is required to download ${APP_NAME}"
 	fi
 }
 
 cleanup() {
+	local rc=$?
+	trap - 0 INT TERM
+	set +e
+	if [ "$MUTATING" = 1 ] && [ "$COMPLETE" != 1 ]; then
+		info "Installation failed; restoring previous files and configuration"
+		rollback_files || info "Automatic restore failed. Backup: $STATE_DIR/rollback.tar.gz"
+		if [ "$SERVICE_CHANGED" = 1 ]; then
+			if [ "$WAS_ENABLED" = 1 ]; then /etc/init.d/byedpi enable; else /etc/init.d/byedpi disable; fi
+			if [ "$WAS_RUNNING" = 1 ]; then /etc/init.d/byedpi restart; else /etc/init.d/byedpi stop; fi
+		fi
+		[ "$PODKOP_CHANGED" != 1 ] || /etc/init.d/podkop restart
+		reload_luci || true
+		[ "$rc" != 0 ] || rc=1
+	fi
+	[ "$INSTALL_LOCKED" != 1 ] || rmdir "$TEST_START_LOCK"
 	rm -rf "$WORK_DIR"
+	exit "$rc"
+}
+
+backup_files() {
+	local path
+	umask 077
+	mkdir -p "$WORK_DIR"
+	: > "$WORK_DIR/existing.list"
+	: > "$WORK_DIR/absent.list"
+	for path in $INSTALL_PATHS; do
+		if [ -e "$path" ]; then
+			printf '%s\n' "${path#/}" >> "$WORK_DIR/existing.list"
+		else
+			printf '%s\n' "$path" >> "$WORK_DIR/absent.list"
+		fi
+	done
+	tar -czf "$WORK_DIR/rollback.tar.gz" -C / -T "$WORK_DIR/existing.list"
+	# Keep the last pre-install snapshot across reboots, without growing on each update.
+	mkdir -p "$STATE_DIR"
+	cp "$WORK_DIR/rollback.tar.gz" "$STATE_DIR/rollback.tar.gz"
+	cp "$WORK_DIR/absent.list" "$STATE_DIR/rollback-absent.list"
+	info "Backup: $STATE_DIR/rollback.tar.gz"
+}
+
+rollback_files() {
+	local path
+	# All paths come from the fixed file manifest above, never a downloaded command.
+	while IFS= read -r path; do rm -f "$path"; done < "$WORK_DIR/absent.list"
+	tar -xzf "$WORK_DIR/rollback.tar.gz" -C /
+	uci -q revert byedpi || true
+	uci -q revert podkop || true
+}
+
+ensure_test_dependencies() {
+	local packages=""
+	have curl || packages="curl"
+	[ -s /etc/ssl/certs/ca-certificates.crt ] || packages="${packages:+$packages }ca-bundle"
+	[ -n "$packages" ] || return 0
+	info "Installing test dependencies: $packages"
+	if have opkg; then
+		opkg update || die "Could not update package lists"
+		opkg install $packages || die "Could not install test dependencies"
+	elif have apk; then
+		apk add $packages || die "Could not install test dependencies"
+	else
+		die "Install curl and ca-bundle with your OpenWrt package manager"
+	fi
 }
 
 find_local_source() {
@@ -180,15 +262,20 @@ install_byedpi_package() {
 }
 
 start_byedpi_service() {
-	[ "$BYEDPI_START" = "1" ] || {
-		info "Skipping ByeDPI service start"
+	local existed="${1:-1}" tries=0
+	if [ "$BYEDPI_START" = 0 ] || { [ "$BYEDPI_START" = auto ] && [ "$existed" = 1 ]; }; then
+		info "Preserving ByeDPI runtime and autostart state"
 		return 0
-	}
-
-	[ -x /etc/init.d/byedpi ] || return 0
-	/etc/init.d/byedpi enable >/dev/null 2>&1 || true
-	/etc/init.d/byedpi restart >/dev/null 2>&1 || true
-	info "Started ByeDPI service"
+	fi
+	SERVICE_CHANGED=1
+	/etc/init.d/byedpi enable || die "Could not enable ByeDPI"
+	/etc/init.d/byedpi start || die "Could not start ByeDPI"
+	until /etc/init.d/byedpi status >/dev/null 2>&1; do
+		tries=$((tries + 1))
+		[ "$tries" -lt 10 ] || die "ByeDPI did not become ready"
+		sleep 1
+	done
+	info "ByeDPI service is running"
 }
 
 normalize_byedpi_config() {
@@ -206,7 +293,7 @@ normalize_byedpi_config() {
 		uci set byedpi.main.options="$cmd_opts"
 	fi
 
-	uci commit byedpi
+	[ -z "$(uci -q changes byedpi || true)" ] || uci commit byedpi
 }
 
 ensure_byedpi() {
@@ -215,7 +302,7 @@ ensure_byedpi() {
 	if has_byedpi; then
 		info "ByeDPI is already installed"
 		normalize_byedpi_config
-		start_byedpi_service
+		start_byedpi_service 1
 		return 0
 	fi
 
@@ -236,7 +323,7 @@ ensure_byedpi() {
 
 	has_byedpi || die "ByeDPI package was installed, but /usr/bin/ciadpi or /etc/init.d/byedpi is still missing"
 	normalize_byedpi_config
-	start_byedpi_service
+	start_byedpi_service 0
 }
 
 configure_podkop_byedpi() {
@@ -257,10 +344,10 @@ configure_podkop_byedpi() {
 	fi
 
 	if [ "$exists" = "1" ]; then
-		info "Normalizing Podkop section '$PODKOP_SECTION'"
-	else
-		info "Creating Podkop section '$PODKOP_SECTION'"
+		info "Preserving existing Podkop section '$PODKOP_SECTION'"
+		return 0
 	fi
+	info "Creating Podkop section '$PODKOP_SECTION'"
 
 	uci set "podkop.$PODKOP_SECTION=section"
 	uci set "podkop.$PODKOP_SECTION.connection_type=proxy"
@@ -276,7 +363,8 @@ configure_podkop_byedpi() {
 	[ "$exists" = "0" ] && set_state podkop_section_created_by_installer 1
 
 	if [ "$PODKOP_RESTART" = "1" ] && [ -x /etc/init.d/podkop ]; then
-		/etc/init.d/podkop restart >/dev/null 2>&1 || true
+		PODKOP_CHANGED=1
+		/etc/init.d/podkop restart || die "Could not reload Podkop integration"
 	fi
 
 	info "Configured Podkop section '$PODKOP_SECTION'"
@@ -290,38 +378,79 @@ install_files() {
 	cp -R "$src/htdocs/." /www/
 	cp -R "$src/root/." /
 
+	chmod 0755 /www/luci-static/resources/view/byedpi /usr/share/byedpi-luci
+	chmod 0644 /www/luci-static/resources/view/byedpi/main.js /www/luci-static/resources/view/byedpi/byedpi.js \
+		/usr/share/byedpi-luci/strategies.txt /usr/share/byedpi-luci/domains.txt \
+		/usr/share/byedpi-luci/proxytest.results /usr/share/byedpi-luci/score.awk \
+		/usr/share/luci/menu.d/luci-app-byedpi.json /usr/share/rpcd/acl.d/luci-app-byedpi.json
 	chmod 0755 /usr/libexec/byedpi-luci
+	chmod 0755 /usr/libexec/byedpi-luci-test
 	chmod 0755 /etc/uci-defaults/50_luci-byedpi
-	/etc/uci-defaults/50_luci-byedpi || true
+	# Configuration migration and cache refresh are handled once by this installer.
+	rm -f /etc/uci-defaults/50_luci-byedpi
 }
 
 reload_luci() {
 	info "Refreshing LuCI"
 	rm -f /tmp/luci-indexcache* /var/luci-indexcache* 2>/dev/null || true
-	[ -x /etc/init.d/rpcd ] && (/etc/init.d/rpcd reload >/dev/null 2>&1 || /etc/init.d/rpcd restart >/dev/null 2>&1 || true)
-	[ -x /etc/init.d/uhttpd ] && (/etc/init.d/uhttpd reload >/dev/null 2>&1 || /etc/init.d/uhttpd restart >/dev/null 2>&1 || true)
+	if [ -x /etc/init.d/rpcd ]; then
+		/etc/init.d/rpcd reload || return 1
+	fi
 }
 
 main() {
-	local src
+	local src test_pid path
 
-	trap cleanup EXIT INT TERM
+	trap cleanup 0
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
 	check_openwrt
-	init_state
-
-	if [ "${SKIP_BYEDPI_CHECK:-0}" != "1" ]; then
-		ensure_byedpi
+	# Recover a dead worker before locking: status deliberately skips orphan
+	# recovery while this shared lock protects a worker that is still starting.
+	if [ -x /usr/libexec/byedpi-luci-test ]; then
+		/usr/libexec/byedpi-luci-test status >/dev/null 2>&1 || true
 	fi
-	configure_podkop_byedpi
-
+	mkdir "$TEST_START_LOCK" 2>/dev/null || die "A test or another installation is starting; retry after it finishes"
+	INSTALL_LOCKED=1
+	case "$BYEDPI_START" in auto|0|1) ;; *) die "BYEDPI_START must be auto, 0 or 1" ;; esac
+	[ -z "$(uci -q changes byedpi || true)$(uci -q changes podkop || true)" ] || die "Save or revert pending ByeDPI/Podkop changes in LuCI before updating"
+	# Replacing a running shell worker may prevent its cleanup from executing.
+	if [ -x /usr/libexec/byedpi-luci-test ]; then
+		[ "$(cat /tmp/byedpi-luci-test-v2/state 2>/dev/null || true)" != running ] ||
+			die "Stop the strategy test in LuCI before updating"
+	fi
+	test_pid="$(cat /tmp/byedpi-luci-test.lock/pid 2>/dev/null || true)"
+	if [ -n "$test_pid" ] && kill -0 "$test_pid" 2>/dev/null; then
+		die "Stop the legacy strategy test in LuCI before updating"
+	fi
 	if src="$(find_local_source)"; then
 		info "Using local source: $src"
 	else
 		src="$(fetch_source)"
 	fi
+	for path in root/usr/libexec/byedpi-luci root/usr/libexec/byedpi-luci-test root/usr/share/byedpi-luci/score.awk htdocs/luci-static/resources/view/byedpi/main.js; do
+		[ -s "$src/$path" ] || die "Source is incomplete: $path"
+	done
+	sh -n "$src/root/usr/libexec/byedpi-luci"
+	sh -n "$src/root/usr/libexec/byedpi-luci-test"
+	ensure_test_dependencies
+	have curl && have netstat || die "curl and BusyBox netstat are required"
+	[ -s /etc/ssl/certs/ca-certificates.crt ] || die "HTTPS certificate bundle is missing"
+	WAS_ENABLED="$(bool_status /etc/init.d/byedpi enabled)"
+	WAS_RUNNING="$(bool_status /etc/init.d/byedpi status)"
+	backup_files
+	MUTATING=1
+	init_state
+	if [ "${SKIP_BYEDPI_CHECK:-0}" != "1" ]; then
+		ensure_byedpi
+	fi
+	configure_podkop_byedpi
 
 	install_files "$src"
 	reload_luci
+	/usr/libexec/byedpi-luci status >/dev/null
+	/usr/libexec/byedpi-luci-test status >/dev/null
+	COMPLETE=1
 
 	info "Installed ${APP_NAME}"
 	echo "Open LuCI: Services -> ByeDPI"
