@@ -1,9 +1,17 @@
-# Input: id|stage|round|probe|ok|milliseconds|bytes|bytes_per_second
+# Input: id|stage|round|probe|ok|milliseconds|bytes|bytes_per_second[|curl_code|http_code]
 # Output: id|total|failed|slow|median|p95|jitter|min_rate|rounds|eligible
 # POSIX awk: OpenWrt does not require GNU awk or a Node/Python runtime.
 BEGIN { FS = OFS = "|" }
-NF == 8 && $2 == stage {
+(NF == 8 || NF == 10) && $2 == stage {
     id = $1 + 0
+    key = id SUBSEP $4
+    attempts[key]++
+    if (!$5) errors[key]++
+    if (!$5 && NF == 10 && $9 == 28) timeouts[key]++
+    if (!$5 && NF == 10 && $10 >= 400) http_errors[key]++
+    if ($7 > max_bytes[key]) max_bytes[key] = $7
+    if ($8 > peak_rate[key]) peak_rate[key] = $8
+    if ($5 && $8 > 0 && (!good_rate[key] || $8 < good_rate[key])) good_rate[key] = $8
     if (!(id in total)) ids[++count] = id
     total[id]++
     if (!$5) failed[id]++
@@ -41,6 +49,13 @@ function better(a, b, x, y) {
     return a < b
 }
 END {
+    if (report == "endpoints") {
+        for (key in attempts) {
+            split(key, parts, SUBSEP)
+            print parts[1],parts[2],attempts[key],errors[key]+0,timeouts[key]+0,http_errors[key]+0,max_bytes[key]+0,peak_rate[key]+0,good_rate[key]+0
+        }
+        exit
+    }
     for (z = 1; z <= count; z++) {
         id = ids[z]
         for (i = 2; i <= n[id]; i++) {

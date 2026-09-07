@@ -66,3 +66,19 @@ test('all failures, empty input and an absent endpoint never look healthy', () =
   const onlyGoogle = samples(1, Array(12).fill(200)).map(row => row.replace('|youtube|', '|google|'));
   assert.equal(rank(onlyGoogle)[0].eligible, 0);
 });
+
+test('extended samples retain HTTP and timeout failures in ranking', () => {
+  const rows = samples(1, Array(12).fill(200)).map(r => r + '|0|200');
+  rows.push('1|stable|4|download|0|8002|21965|2744|28|200');
+  assert.equal(rank(rows)[0].failed, 1);
+  assert.equal(rank(rows)[0].eligible, 0);
+});
+
+test('endpoint breakdown distinguishes failed transfers from healthy YouTube', () => {
+  const rows = samples(19, Array(12).fill(150)).slice(0,12);
+  rows.push('19|stable|1|download|0|8002|21965|2744|28|200');
+  const p = spawnSync(awk, ['-v','stage=stable','-v','report=endpoints','-f',scoreFile], {input:rows.join('\n')+'\n',encoding:'utf8'});
+  assert.equal(p.status,0,p.stderr);
+  assert.match(p.stdout,/19\|youtube\|6\|0\|0\|0\|0\|0\|0/);
+  assert.match(p.stdout,/19\|download\|1\|1\|1\|0\|21965\|2744\|0/);
+});

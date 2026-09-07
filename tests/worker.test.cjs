@@ -45,7 +45,33 @@ proxy_port=2080
 probe 1 screen 1 google
 cat "$WORK/samples"
 `);
-  assert.equal(out, '1|screen|1|google|1|188|0|0');
+  assert.equal(out, '1|screen|1|google|1|188|0|0|0|204');
+});
+
+test('bulk probes are spread over time and capped at eight per candidate', () => {
+  run(`put stable_started 1000; put minutes 60
+date() { echo "$now"; }
+now=1000; download_due 1 || exit 1
+download_due 1 && exit 1
+now=1449; download_due 1 && exit 1
+now=1450; download_due 1 || exit 1
+download_due 2 || exit 1
+now=10000
+for i in 1 2 3 4 5 6; do download_due 1 || exit 1; done
+download_due 1 && exit 1
+exit 0
+`);
+});
+
+test('legacy report conversion preserves its timestamp and releases the shared lock', () => {
+  run(`put state complete
+printf '{"checked_at":123}' > "$WORK/status.json"
+jsonfilter() { echo 123; }
+snapshot() { [ "$1" = 123 ] || exit 9; printf '{"schema_version":2}' > "$WORK/status.json"; }
+status >/dev/null
+[ ! -d "$WORK.start" ] || exit 1
+grep -q schema_version "$WORK/status.json"
+`);
 });
 test('stop request prevents further network probes', () => {
   run(`touch "$WORK/stop"\ncurl() { echo network-called >&2; exit 1; }\nprobe 1 stable 1 youtube || :\n[ ! -s "$WORK/samples" ]\n`);

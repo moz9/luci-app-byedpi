@@ -160,12 +160,24 @@ probe() {
             download:200) [ "$bytes" -eq 1048576 ] && ok=1 ;;
         esac
     fi
-    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$id" "$stage" "$round" "$kind" "$ok" "$ms" "$bytes" "$rate" >> "$WORK/samples"
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$id" "$stage" "$round" "$kind" "$ok" "$ms" "$bytes" "$rate" "$rc" "$code" >> "$WORK/samples"
+}
+
+download_due() {
+    local id="$1" sent elapsed minutes started
+    sent="$(get download_count_$id)"; sent="${sent:-0}"
+    [ "$sent" -lt 8 ] || return 1
+    minutes="$(get minutes)"; minutes="${minutes:-5}"
+    started="$(get stable_started)"; started="${started:-$(date +%s)}"
+    elapsed=$(($(date +%s) - started))
+    [ "$elapsed" -ge $((sent * minutes * 60 / 8)) ] || return 1
+    put "download_count_$id" "$((sent + 1))"
 }
 
 score() { awk -v stage="$1" -f "$DATA_DIR/score.awk" "$WORK/samples"; }
 snapshot() {
     local stage id total failed slow median p95 jitter rate rounds eligible strategy recommended=""
+    local eid kind attempts errors timeouts http_errors max_bytes peak_rate good_rate
     stage="$(get stage)"
     score "$stage" > "$WORK/ranking.tmp"
     mv "$WORK/ranking.tmp" "$WORK/ranking"
@@ -173,18 +185,20 @@ snapshot() {
         recommended="$(awk -F '|' '$10 == 1 { print $1; exit }' "$WORK/ranking")"
     fi
     json_init
+    json_add_int schema_version 2
     json_add_boolean active 1
     json_add_string state "$(get state)"
     json_add_string stage "$stage"
     json_add_string message "$(get message)"
     json_add_int started "$(get started)"
-    json_add_int checked_at "$(date +%s)"
+    json_add_int checked_at "${1:-$(date +%s)}"
     json_add_int duration_minutes "$(get minutes)"
     json_add_int candidate_count "$(wc -l < "$WORK/candidates")"
     json_add_int current_id "$(get current_id)"
     json_add_int round "$(get round)"
     json_add_string recommended_id "$recommended"
     json_add_array ranking
+    awk -v stage="$stage" -v report=endpoints -f "$DATA_DIR/score.awk" "$WORK/samples" > "$WORK/endpoints"
     while IFS='|' read -r id total failed slow median p95 jitter rate rounds eligible; do
         [ -n "$id" ] || continue
         strategy="$(sed -n "${id}p" "$WORK/candidates")"
@@ -200,6 +214,21 @@ snapshot() {
         json_add_int min_rate "$rate"
         json_add_int rounds "$rounds"
         json_add_boolean eligible "$eligible"
+        json_add_array endpoints
+        while IFS='|' read -r eid kind attempts errors timeouts http_errors max_bytes peak_rate good_rate; do
+            [ "$eid" = "$id" ] || continue
+            json_add_object
+            json_add_string kind "$kind"
+            json_add_int total "$attempts"
+            json_add_int failed "$errors"
+            json_add_int timeouts "$timeouts"
+            json_add_int http_errors "$http_errors"
+            json_add_int max_bytes "$max_bytes"
+            json_add_int peak_rate "$peak_rate"
+            json_add_int min_rate "$good_rate"
+            json_close_object
+        done < "$WORK/endpoints"
+        json_close_array
         json_close_object
     done < "$WORK/ranking"
     json_close_array
@@ -256,7 +285,7 @@ run_candidate() {
         pass=$((pass + 1))
     done
     # At most 8 MiB per finalist and 3 finalists. HEAD probes have no body.
-    if [ "$stage" = stable ] && [ "$round" -le 8 ]; then
+    if [ "$stage" = stable ] && download_due "$id"; then
         probe "$id" "$stage" "$round" download
     fi
     [ "$stage" = screen ] && stop_proxy
@@ -299,6 +328,7 @@ worker() {
     [ -s "$WORK/finalists" ] || { finish complete "Рабочие кандидаты не найдены. Проверьте DNS, доступ и ошибки HTTPS."; return; }
     count="$(wc -l < "$WORK/finalists")"
     put stage stable
+    put stable_started "$(date +%s)"
     end=$(($(date +%s) + minutes * 60))
     # Complete equal rounds; never compare a partial round as final evidence.
     while [ "$(date +%s)" -lt "$end" ]; do
@@ -328,11 +358,12 @@ start() {
     mkdir -p "$WORK"
     stop_all_proxies
     rm -f "$WORK/stop"
+    rm -f "$WORK"/download_count_*
     : > "$WORK/samples"
     {
         printf '%s\n' "$current"
         [ "$mode" = auto ] && sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$DATA_DIR/strategies.txt"
-    } | awk 'NF && !seen[$0]++ {print; n++; if(n==64) exit}' > "$WORK/candidates"
+    } | awk 'NF && !seen[$0]++ {print; n++; if(n==96) exit}' > "$WORK/candidates"
     [ -s "$WORK/candidates" ] || { rmdir "$WORK.start"; return 1; }
     put mode "$mode"; put minutes "$minutes"; put started "$(date +%s)"
     put current_id 0; put round 0; put state running; put stage resolve
@@ -350,6 +381,16 @@ status() {
         [ ! -d "$WORK.start" ]; then
         # Only terminate an orphan with the recorded /proc identity.
         finish interrupted "Проверка прервана. Рекомендация не сформирована."
+    fi
+    if [ "$(get state)" != running ] && ! grep -q '"schema_version"' "$WORK/status.json" &&
+        mkdir "$WORK.start" 2>/dev/null; then
+        # Upgrade a retained report without rerunning probes or changing its outcome.
+        (
+            trap 'rmdir "$WORK.start" 2>/dev/null || true' 0
+            if [ "$(get state)" != running ] && ! grep -q '"schema_version"' "$WORK/status.json"; then
+                snapshot "$(jsonfilter -i "$WORK/status.json" -e '@.checked_at' 2>/dev/null)"
+            fi
+        )
     fi
     cat "$WORK/status.json"
 }

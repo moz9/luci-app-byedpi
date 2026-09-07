@@ -396,15 +396,27 @@ function renderTestProgress(status) {
 	const body = table.querySelector("tbody");
 	body.replaceChildren.apply(body, (status.ranking || []).map(function(item) {
 		const recommended = String(item.id) === String(status.recommended_id);
+		const webEndpoints = (item.endpoints || []).filter(function(e) { return e.kind === "youtube" || e.kind === "google"; });
+		const webOnlyPassed = status.state === "complete" && !item.eligible && item.rounds >= 3 && item.p95_ms < 1500 &&
+			webEndpoints.length === 2 && webEndpoints.every(function(e) { return e.total >= 6 && e.failed === 0; });
 		return E("tr", {}, [
 			E("td", {}, [ E("b", {}, (recommended ? _("Рекомендуется · ") : "") + (item.id === 1 ? _("Текущая при запуске") : _("Кандидат ") + item.id)),
-				E("details", {}, [ E("summary", {}, _("Аргументы")), E("pre", { class: "byedpi-command" }, item.strategy) ]) ]),
+				E("details", {}, [ E("summary", {}, _("Аргументы")), E("pre", { class: "byedpi-command" }, item.strategy) ]),
+				webOnlyPassed ? E("div", {class:"byedpi-muted"}, _("Короткие запросы YouTube/Google без ошибок. Передача данных не подтверждена.")) : "" ]),
 			E("td", {}, [ E("div", {}, _("Ошибок: ") + item.failed + "/" + item.total),
+				...(item.endpoints || []).map(function(endpoint) {
+					const labels = { youtube: "YouTube", google: "Google", download: "Cloudflare", start: _("Запуск прокси") };
+					return E("div", {}, (labels[endpoint.kind] || endpoint.kind) + ": " + endpoint.failed + "/" + endpoint.total);
+				}),
 				E("div", {}, _("Задержек ≥1,5 с: ") + item.slow), E("div", {}, _("Кругов: ") + item.rounds) ]),
 			E("td", {}, item.median_ms === 999999 ? "—" : [
 				E("div", {}, item.median_ms + _(" мс обычно")), E("div", {}, item.p95_ms + _(" мс в 95% запросов")),
 				E("div", {}, _("Разброс: ") + item.jitter_ms + _(" мс")) ]),
-			E("td", {}, item.min_rate ? (item.min_rate * 8 / 1000000).toFixed(1) + _(" Мбит/с") : "—"),
+			E("td", {}, [item.min_rate ? (item.min_rate * 8 / 1000000).toFixed(1) + _(" Мбит/с") : _("Полная загрузка не подтверждена"),
+				...(item.endpoints || []).filter(function(e) { return e.kind === "download" && e.failed; }).map(function(e) {
+					return E("div", {class:"byedpi-muted"}, _("Макс. получено: ") + Math.round(e.max_bytes / 1024) + _(" КиБ из 1024") +
+						(e.timeouts ? _(" · таймаутов: ") + e.timeouts : "") + (e.http_errors ? _(" · ошибок HTTP: ") + e.http_errors : ""));
+				})]),
 			E("td", {}, E("button", {
 				class: "btn cbi-button" + (recommended ? " cbi-button-apply" : ""), disabled: running ? "disabled" : null,
 				click: function() {
@@ -625,7 +637,7 @@ return view.extend({
 		const diagnostics = data[2] || { checks: [] };
 
 		const page = E("div", { class: "byedpi-page" }, [
-			E("h2", {}, [ _("Настройки ByeDPI"), E("small", { class: "byedpi-muted", style: "margin-left:12px;font-size:13px" }, "0.2.0") ]),
+			E("h2", {}, [ _("Настройки ByeDPI"), E("small", { class: "byedpi-muted", style: "margin-left:12px;font-size:13px" }, "0.2.1") ]),
 			E("div", { class: "byedpi-tabs" }, [
 				E("button", { class: "btn cbi-button active", "data-tab": "settings" }, _("Настройки")),
 				E("button", { class: "btn cbi-button", "data-tab": "diagnostics" }, _("Диагностика")),
