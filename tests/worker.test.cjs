@@ -21,6 +21,11 @@ test('test strategies cannot take over the live listener or daemonize', () => {
   const args = run(`prepare_strategy '-i 0.0.0.0 -p1080 --daemon --pidfile /tmp/live.pid --cache-dump=/tmp/cache -s1 -At,s'\n`);
   assert.equal(args, '-s1 -At,s');
 });
+
+test('debug output flags are stripped before an isolated candidate starts', () => {
+  assert.equal(run(`prepare_strategy '-s1 -x 2 --debug -At,s'\n`), '-s1 -At,s');
+  assert.equal(run(`prepare_strategy '-x2 -s1'\n`), '-s1');
+});
 test('transparent mode and shell quoting are rejected instead of executed', () => {
   run(`if prepare_strategy '-E -s1'; then exit 1; fi\nif prepare_strategy '--fake-data="bad data"'; then exit 1; fi\nif prepare_strategy '-p'; then exit 1; fi\n`);
 });
@@ -46,6 +51,27 @@ probe 1 screen 1 google
 cat "$WORK/samples"
 `);
   assert.equal(out, '1|screen|1|google|1|188|0|0|0|204');
+});
+
+test('screening probes have a shorter timeout than stability rounds', () => {
+  const out = run(`
+curl() { printf '%s\\n' "$@" >> "$WORK/args"; printf '200|0.1|0|0'; }
+proxy_port=2080
+probe 1 screen 1 youtube
+printf 'SCREEN\\n' >> "$WORK/args"
+probe 1 stable 1 youtube
+cat "$WORK/args"
+`);
+  assert.match(out, /--max-time\n3[\s\S]*SCREEN[\s\S]*--max-time\n8/);
+});
+
+test('a YouTube consent redirect counts as a reachable short request', () => {
+  const out = run(`curl() { printf '302|0.12|0|0'; }
+proxy_port=2080
+probe 1 screen 1 youtube
+cat "$WORK/samples"
+`);
+  assert.equal(out, '1|screen|1|youtube|1|120|0|0|0|302');
 });
 
 test('bulk probes are spread over time and capped at eight per candidate', () => {

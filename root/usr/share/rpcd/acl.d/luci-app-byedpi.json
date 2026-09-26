@@ -2,19 +2,13 @@
   "luci-app-byedpi": {
     "description": "Grant UCI and RPC access to LuCI app byedpi",
     "read": {
-      "file": {
-        "/usr/libexec/byedpi-luci": [ "exec" ]
-      },
-      "ubus": {
-        "service": [ "list" ]
-      },
-      "uci": [ "byedpi", "podkop" ]
+      "uci": [ "byedpi" ]
     },
     "write": {
       "file": {
         "/usr/libexec/byedpi-luci": [ "exec" ]
       },
-      "uci": [ "byedpi", "podkop" ]
+      "uci": [ "byedpi" ]
     }
   }
 }

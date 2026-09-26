@@ -42,8 +42,8 @@ prepare_strategy() (
     for word in $strategy; do
         if [ "$skip" = 1 ]; then skip=0; continue; fi
         case "$word" in
-            -i|-p|-w|-y|--ip|--port|--pidfile|--cache-dump) skip=1 ;;
-            -i?*|-p?*|-w?*|-y?*|--ip=*|--port=*|--pidfile=*|--cache-dump=*|-D|--daemon) ;;
+            -i|-p|-w|-y|-x|--ip|--port|--pidfile|--cache-dump) skip=1 ;;
+            -i?*|-p?*|-w?*|-y?*|-x?*|--ip=*|--port=*|--pidfile=*|--cache-dump=*|-D|--daemon|--debug) ;;
             -E|--transparent|--|-h|--help|-v|--version|-[DFESUNY]?*) return 1 ;;
             --*)
                 name="$(printf '%s' "$word" | cut -d = -f1)"
@@ -74,7 +74,7 @@ start_proxy() {
     # Intentional splitting; no shell syntax is executed.
     set -- $normalized
     set +f
-    "$CIADPI" "$@" -i 127.0.0.1 -p "$proxy_port" -c 32 >"$WORK/proxy_$active_slot.log" 2>&1 &
+    "$CIADPI" "$@" -i 127.0.0.1 -p "$proxy_port" -c 32 >/dev/null 2>&1 &
     put "proxy_pid_$active_slot" "$!"
     put "proxy_stamp_$active_slot" "$(pid_stamp "$(get proxy_pid_$active_slot)")"
     put "proxy_port_$active_slot" "$proxy_port"
@@ -127,8 +127,9 @@ resolve_targets() {
 
 probe() {
     local id="$1" stage="$2" round="$3" kind="$4"
-    local url method host target_ip result rc=0 code seconds bytes rate ok=0 ms
+    local url method host target_ip result rc=0 code seconds bytes rate ok=0 ms connect_timeout=4 max_time=8
     stopping && return 1
+	if [ "$stage" = screen ]; then connect_timeout=2; max_time=3; fi
     case "$kind" in
         youtube) host="www.youtube.com"; url="https://www.youtube.com/"; method="--head" ;;
         google) host="www.gstatic.com"; url="https://www.gstatic.com/generate_204"; method="--head" ;;
@@ -144,7 +145,7 @@ probe() {
     # Do not follow redirects to an unpinned host. SNI and TLS use the URL host.
     # No retries: a failed attempt must remain visible in the score.
     result="$(curl --silent --show-error --fail --ipv4 --resolve "$host:443:$target_ip" $method \
-        --socks5 "127.0.0.1:$proxy_port" --noproxy "" --connect-timeout 4 --max-time 8 \
+        --socks5 "127.0.0.1:$proxy_port" --noproxy "" --connect-timeout "$connect_timeout" --max-time "$max_time" \
         --max-filesize 1048576 --output /dev/null \
         --write-out '%{http_code}|%{time_total}|%{size_download}|%{speed_download}' \
         "$url" 2>"$WORK/curl.log")" || rc="$?"
@@ -156,7 +157,7 @@ probe() {
     bytes="$(awk -v n="$bytes" 'BEGIN { printf "%.0f", n }')"
     rate="$(awk -v n="$rate" 'BEGIN { printf "%.0f", n }')"
     if [ "$rc" = 0 ]; then
-        case "$kind:$code" in youtube:200|google:204) ok=1 ;;
+        case "$kind:$code" in youtube:200|youtube:204|youtube:301|youtube:302|youtube:303|youtube:307|youtube:308|google:204) ok=1 ;;
             download:200) [ "$bytes" -eq 1048576 ] && ok=1 ;;
         esac
     fi
@@ -362,14 +363,14 @@ start() {
     : > "$WORK/samples"
     {
         printf '%s\n' "$current"
-        [ "$mode" = auto ] && sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$DATA_DIR/strategies.txt"
+        [ "$mode" = auto ] && sed -e 's/#.*//' -e 's,//.*$,,' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$DATA_DIR/strategies.txt"
     } | awk 'NF && !seen[$0]++ {print; n++; if(n==96) exit}' > "$WORK/candidates"
     [ -s "$WORK/candidates" ] || { rmdir "$WORK.start"; return 1; }
     put mode "$mode"; put minutes "$minutes"; put started "$(date +%s)"
     put current_id 0; put round 0; put state running; put stage resolve
     put message "Получение реальных адресов тестовых сайтов"
     snapshot
-    sh "$0" worker </dev/null >"$WORK/worker.log" 2>&1 &
+    sh "$0" worker </dev/null >/dev/null 2>&1 &
     put worker_pid "$!"
     put worker_stamp "$(pid_stamp "$(get worker_pid)")"
     rmdir "$WORK.start"

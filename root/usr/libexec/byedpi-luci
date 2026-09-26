@@ -3,7 +3,6 @@
 HELPER_NAME="byedpi-luci"
 DATA_DIR="/usr/share/byedpi-luci"
 STRATEGIES_FILE="$DATA_DIR/strategies.txt"
-DOMAINS_FILE="$DATA_DIR/domains.txt"
 
 . /usr/share/libubox/jshn.sh
 
@@ -14,16 +13,17 @@ clean_lines() {
 }
 
 json_status() {
-	local running=0 pid="" command="" enabled=0 current="" tmp_command part
+	local running=0 pid="" command="" enabled=0 config_enabled=0 current="" tmp_command part service_json
 
 	current="$(uci -q get byedpi.main.cmd_opts || true)"
 	[ -n "$current" ] || current="$(uci -q get byedpi.main.options || true)"
 	/etc/init.d/byedpi enabled >/dev/null 2>&1 && enabled=1
+	[ "$(uci -q get byedpi.main.enabled)" = 1 ] && config_enabled=1
 
-	if ubus call service list '{"name":"byedpi"}' >/tmp/byedpi-luci-service.json 2>/dev/null; then
-		running="$(jsonfilter -i /tmp/byedpi-luci-service.json -e '@.byedpi.instances.instance1.running' 2>/dev/null || echo 0)"
-		pid="$(jsonfilter -i /tmp/byedpi-luci-service.json -e '@.byedpi.instances.instance1.pid' 2>/dev/null || true)"
-		command="$(jsonfilter -i /tmp/byedpi-luci-service.json -e '@.byedpi.instances.instance1.command' 2>/dev/null || true)"
+	if service_json="$(ubus call service list '{"name":"byedpi"}' 2>/dev/null)"; then
+		running="$(jsonfilter -s "$service_json" -e '@.byedpi.instances.instance1.running' 2>/dev/null || echo 0)"
+		pid="$(jsonfilter -s "$service_json" -e '@.byedpi.instances.instance1.pid' 2>/dev/null || true)"
+		command="$(jsonfilter -s "$service_json" -e '@.byedpi.instances.instance1.command' 2>/dev/null || true)"
 	fi
 
 	[ "$running" = "true" ] && running=1
@@ -36,6 +36,7 @@ json_status() {
 	json_init
 	json_add_boolean running "$running"
 	json_add_boolean enabled "$enabled"
+	json_add_boolean config_enabled "$config_enabled"
 	json_add_string pid "$pid"
 	json_add_string current_strategy "$current"
 	json_add_array command
@@ -81,11 +82,59 @@ add_check() {
 	json_close_object
 }
 
+# cmd_opts uses whitespace splitting in the upstream init script. Never eval it.
+listener_settings() {
+	local current="$1" word next="" options
+	SOCKS_HOST=127.0.0.1 SOCKS_PORT=1080
+	set -f
+	for word in $current; do
+		case "$next" in
+			ip) SOCKS_HOST="$word"; next=""; continue ;;
+			port) SOCKS_PORT="$word"; next=""; continue ;;
+		esac
+		case "$word" in
+			-i|--ip) next=ip ;;
+			-p|--port) next=port ;;
+			-i?*) SOCKS_HOST="${word#-i}" ;;
+			-p?*) SOCKS_PORT="${word#-p}" ;;
+			--ip=*) SOCKS_HOST="${word#--ip=}" ;;
+			--port=*) SOCKS_PORT="${word#--port=}" ;;
+		esac
+	done
+	set +f
+	[ "$SOCKS_HOST" != 0.0.0.0 ] || SOCKS_HOST=127.0.0.1
+	case "$SOCKS_PORT" in ''|*[!0-9]*) SOCKS_PORT=1080 ;; esac
+}
+
+merge_preset_listener() (
+	local strategy="$1" current="$2" word next="" old_ip="" old_port="" has_ip=0 has_port=0
+	set -f
+	for word in $current; do
+		case "$next" in
+			ip) old_ip="-i $word"; next=""; continue ;;
+			port) old_port="-p $word"; next=""; continue ;;
+		esac
+		case "$word" in
+			-i|--ip) next=ip ;;
+			-p|--port) next=port ;;
+			-i?*|--ip=*) old_ip="$word" ;;
+			-p?*|--port=*) old_port="$word" ;;
+		esac
+	done
+	for word in $strategy; do
+		case "$word" in -i|-i?*|--ip|--ip=*) has_ip=1 ;; -p|-p?*|--port|--port=*) has_port=1 ;; esac
+	done
+	[ "$has_ip" = 1 ] || strategy="$strategy${old_ip:+ $old_ip}"
+	[ "$has_port" = 1 ] || strategy="$strategy${old_port:+ $old_port}"
+	printf '%s\n' "$strategy"
+)
+
 diagnostics() {
-	local detail ok port_line proxy_detail podkop_proxy podkop_resolve current
+	local detail port_line proxy_detail podkop_proxy podkop_resolve current curl_result
 
 	current="$(uci -q get byedpi.main.cmd_opts || true)"
 	[ -n "$current" ] || current="$(uci -q get byedpi.main.options || true)"
+	listener_settings "$current"
 
 	json_init
 	json_add_string current_strategy "$current"
@@ -115,6 +164,11 @@ diagnostics() {
 	else
 		add_check "Автозапуск" 0 "disabled"
 	fi
+	if [ "$(uci -q get byedpi.main.enabled)" = 1 ]; then
+		add_check "Инстанс ByeDPI" 1 "Включён в конфигурации"
+	else
+		add_check "Инстанс ByeDPI" 0 "byedpi.main.enabled=0: включите секцию и сохраните"
+	fi
 
 	if /etc/init.d/byedpi status >/dev/null 2>&1; then
 		add_check "Сервис" 1 "running"
@@ -122,32 +176,33 @@ diagnostics() {
 		add_check "Сервис" 0 "not running"
 	fi
 
-	port_line="$(netstat -tulnp 2>/dev/null | grep ':1080 ' | head -n 1)"
+	port_line="$(netstat -tulnp 2>/dev/null | grep ":$SOCKS_PORT " | head -n 1)"
 	if [ -n "$port_line" ]; then
-		add_check "SOCKS 127.0.0.1:1080" 1 "$port_line"
+		add_check "SOCKS $SOCKS_HOST:$SOCKS_PORT" 1 "$port_line"
 	else
-		add_check "SOCKS 127.0.0.1:1080" 0 "Порт 1080 не слушается"
+		add_check "SOCKS $SOCKS_HOST:$SOCKS_PORT" 0 "Порт $SOCKS_PORT не слушается"
 	fi
 
-	if curl --socks5-hostname 127.0.0.1:1080 --connect-timeout 3 -m 8 --fail -L -o /dev/null https://ya.ru >/tmp/byedpi-luci-curl.log 2>&1; then
-		add_check "Проверка через SOCKS" 1 "https://ya.ru доступен через 127.0.0.1:1080"
+	if curl_result="$(curl --socks5-hostname "$SOCKS_HOST:$SOCKS_PORT" --connect-timeout 3 -m 8 --fail -L -o /dev/null https://ya.ru 2>&1)"; then
+		add_check "Проверка через SOCKS" 1 "https://ya.ru доступен через $SOCKS_HOST:$SOCKS_PORT"
 	else
-		proxy_detail="$(tail -n 1 /tmp/byedpi-luci-curl.log 2>/dev/null)"
+		proxy_detail="$(printf '%s\n' "$curl_result" | tail -n 1)"
 		add_check "Проверка через SOCKS" 0 "${proxy_detail:-curl завершился с ошибкой}"
 	fi
 
 	podkop_proxy="$(uci -q get podkop.byedpi.proxy_string || true)"
 	podkop_resolve="$(uci -q get podkop.byedpi.resolve_real_ip_for_routing || true)"
-	if [ "$podkop_proxy" = "socks5://127.0.0.1:1080#byedpi" ]; then
-		add_check "Podkop секция byedpi" 1 "$podkop_proxy"
-	else
-		add_check "Podkop секция byedpi" 0 "${podkop_proxy:-секция не найдена}"
-	fi
-
-	if [ "$podkop_resolve" = "1" ]; then
-		add_check "Podkop resolve real IP" 1 "enabled"
-	else
-		add_check "Podkop resolve real IP" 0 "disabled"
+	if [ -f /etc/config/podkop ]; then
+		if [ "$podkop_proxy" = "socks5://$SOCKS_HOST:$SOCKS_PORT#byedpi" ]; then
+			add_check "Podkop секция byedpi" 1 "$podkop_proxy"
+		else
+			add_check "Podkop секция byedpi" 0 "${podkop_proxy:-секция не найдена}"
+		fi
+		if [ "$podkop_resolve" = "1" ]; then
+			add_check "Podkop resolve real IP" 1 "enabled"
+		else
+			add_check "Podkop resolve real IP" 0 "disabled"
+		fi
 	fi
 
 	json_close_array
@@ -187,6 +242,10 @@ service_action() (
     local action="$1" wanted=1
     case "$action" in start|stop|restart) ;; *) echo "Unsupported service action" >&2; return 1 ;; esac
     lock_service_change || return 1
+	[ "$action" = stop ] || [ "$(uci -q get byedpi.main.enabled)" = 1 ] || {
+		echo "Секция byedpi.main.enabled=0. Включите ByeDPI и сохраните настройки." >&2
+		return 1
+	}
     [ "$action" != stop ] || wanted=0
     /etc/init.d/byedpi "$action" >&2 && wait_service_state "$wanted" || {
         echo "ByeDPI не перешёл в ожидаемое состояние. Проверьте диагностику." >&2
@@ -196,11 +255,16 @@ service_action() (
 )
 
 apply_strategy() (
-    local strategy="$1" enabled="$2" backup was_enabled=0 was_running=0 ok=0 restored=1
+	local strategy="$1" enabled="$2" from_preset="$3" backup was_enabled=0 was_running=0 ok=0 restored=1 current
     [ -n "$strategy" ] || { echo "Strategy is empty" >&2; return 1; }
     [ "$enabled" = 0 ] || enabled=1
     lock_service_change || return 1
     [ -z "$(uci changes byedpi)" ] || { echo "Сначала сохраните или отмените несохранённые изменения ByeDPI" >&2; return 1; }
+	if [ "$from_preset" = 1 ]; then
+		current="$(uci -q get byedpi.main.cmd_opts || true)"
+		[ -n "$current" ] || current="$(uci -q get byedpi.main.options || true)"
+		strategy="$(merge_preset_listener "$strategy" "$current")" || return 1
+	fi
     [ -f /etc/config/byedpi ] || { echo "Конфигурация ByeDPI отсутствует" >&2; return 1; }
     umask 077
     backup="$(mktemp /tmp/byedpi-apply.XXXXXX)" || return 1
@@ -252,7 +316,7 @@ case "$1" in
 		service_action "$2"
 		;;
 	apply)
-		apply_strategy "$2" "$3"
+		apply_strategy "$2" "$3" "$4"
 		;;
 	start-autotest)
 		exec /usr/libexec/byedpi-luci-test start auto "$2" "$3"

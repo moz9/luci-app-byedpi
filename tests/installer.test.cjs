@@ -57,6 +57,23 @@ uci() { case "$*" in
 esac; }
 have() { return 0; }
 `;
+
+test('downloaded package must match the digest of its exact release asset', () => {
+  run(`
+printf 'package data' > "$ROOT/package.ipk"
+expected_digest="$(sha256sum "$ROOT/package.ipk" | cut -d ' ' -f 1)"
+jsonfilter() {
+  case "$*" in
+    *'assets[*].browser_download_url'*) printf 'https://example.invalid/a.ipk\nhttps://example.invalid/b.ipk\n';;
+    *'assets[1].digest'*) printf 'sha256:%s\n' "$expected_digest";;
+    *) echo 'unexpected asset selector' >&2; return 1;;
+  esac
+}
+verify_byedpi_package https://example.invalid/b.ipk "$ROOT/package.ipk"
+printf 'tampered' > "$ROOT/package.ipk"
+if (verify_byedpi_package https://example.invalid/b.ipk "$ROOT/package.ipk" 2>/dev/null); then exit 8; fi
+`);
+});
 test('complete local-source update preserves configs and cleans the installation lock', () => {
   run(fullSetup + `
 reload_luci() { :; }
