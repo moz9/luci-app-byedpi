@@ -131,6 +131,8 @@ ensure_test_dependencies() {
 
 find_local_source() {
 	local script_dir
+	case "$0" in */install.sh|install.sh) ;; *) return 1 ;; esac
+	[ -f "$0" ] || return 1
 
 	script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || pwd)"
 	if [ -f "$script_dir/root/usr/libexec/byedpi-luci" ] && [ -d "$script_dir/htdocs/luci-static" ]; then
@@ -240,9 +242,22 @@ find_byedpi_package_url() {
 	info "Looking for ByeDPI package: arch=${arch}, format=${ext}"
 	download "$BYEDPI_RELEASE_API" "$release_json"
 
-	sed -n 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$release_json" |
+	jsonfilter -i "$release_json" -e '@.assets[*].browser_download_url' |
 		grep -F "_${arch}.${ext}" |
 		head -n 1
+}
+
+verify_byedpi_package() {
+	local url="$1" package="$2" release_json="$WORK_DIR/byedpi-release.json" index digest expected actual
+	index="$(jsonfilter -i "$release_json" -e '@.assets[*].browser_download_url' |
+		awk -v url="$url" '$0 == url { print NR - 1; exit }')"
+	[ -n "$index" ] || die "Downloaded ByeDPI package is absent from the release manifest"
+	digest="$(jsonfilter -i "$release_json" -e "@.assets[$index].digest")"
+	case "$digest" in sha256:*) expected="$(printf '%s' "$digest" | cut -d : -f 2)" ;; *) die "ByeDPI release does not provide a SHA-256 digest" ;; esac
+	[ "$(printf '%s' "$expected" | wc -c)" -eq 64 ] || die "Invalid ByeDPI SHA-256 digest"
+	case "$expected" in *[!0-9a-f]*) die "Invalid ByeDPI SHA-256 digest" ;; esac
+	actual="$(sha256sum "$package" | cut -d ' ' -f 1)"
+	[ "$actual" = "$expected" ] || die "ByeDPI package SHA-256 mismatch"
 }
 
 install_byedpi_package() {
@@ -316,6 +331,7 @@ ensure_byedpi() {
 	package="$WORK_DIR/$(basename "$url")"
 	info "Downloading ByeDPI: $url"
 	download "$url" "$package"
+	verify_byedpi_package "$url" "$package"
 
 	info "Installing ByeDPI"
 	install_byedpi_package "$package" "$ext"

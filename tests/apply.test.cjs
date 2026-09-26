@@ -69,3 +69,58 @@ apply_strategy '-s1' 1
 [ ! -d "$ROOT/tmp/byedpi-luci-test-v2.start" ]
 `);
 });
+
+test('preset keeps a custom SOCKS listener while a custom strategy may change it', () => {
+  run(`
+actual="$(merge_preset_listener '-s1' '-i 127.0.0.1 -p1081 -s2')"
+[ "$actual" = '-s1 -i 127.0.0.1 -p1081' ] || { printf 'listener: %s\\n' "$actual" >&2; exit 1; }
+[ "$(merge_preset_listener '-s1' '--ip=127.0.0.1 --port=1082 -s2')" = '-s1 --ip=127.0.0.1 --port=1082' ]
+[ "$(merge_preset_listener '-s1 -p2080' '-i 127.0.0.1 -p1081 -s2')" = '-s1 -p2080 -i 127.0.0.1' ]
+listener_settings '--ip 127.0.0.1 --port=1082 -s1'
+[ "$SOCKS_HOST:$SOCKS_PORT" = 127.0.0.1:1082 ]
+`);
+});
+
+test('service start explains a disabled UCI instance before touching init', () => {
+  run(`
+printf '#!/bin/sh\\necho called > "$ROOT/init-called"\\n' > "$ROOT/etc/init.d/byedpi"
+chmod +x "$ROOT/etc/init.d/byedpi"
+uci() { [ "$*" != '-q get byedpi.main.enabled' ] || printf '0\\n'; }
+if service_action start 2> "$ROOT/error"; then exit 8; fi
+grep -q 'byedpi.main.enabled=0' "$ROOT/error"
+[ ! -e "$ROOT/init-called" ]
+`);
+});
+
+test('status distinguishes init autostart from the enabled UCI instance', () => {
+  run(`
+printf '#!/bin/sh\nexit 0\n' > "$ROOT/etc/init.d/byedpi"
+chmod +x "$ROOT/etc/init.d/byedpi"
+uci() { case "$*" in '-q get byedpi.main.enabled') echo 0;; esac; }
+ubus() { return 1; }
+json_init() { :; }; json_add_boolean() { printf '%s=%s\n' "$1" "$2"; }
+json_add_string() { :; }; json_add_array() { :; }; json_close_array() { :; }; json_dump() { :; }
+output="$(json_status)"
+printf '%s\n' "$output" | grep -qx 'enabled=1'
+printf '%s\n' "$output" | grep -qx 'config_enabled=0'
+`);
+});
+
+test('diagnostics use the configured SOCKS port and skip absent Podkop', () => {
+  run(`
+uci() { case "$*" in
+  '-q get byedpi.main.cmd_opts') echo '-i 127.0.0.1 -p1081 -s1';;
+  '-q get byedpi.main.enabled') echo 1;;
+  '-q get byedpi.main') echo main;;
+  esac; }
+netstat() { printf 'tcp 0 0 127.0.0.1:1081 0.0.0.0:* LISTEN\n'; }
+curl() { printf '%s\n' "$*" > "$ROOT/curl-args"; return 0; }
+json_init() { :; }; json_add_string() { :; }; json_add_array() { :; }
+json_close_array() { :; }; json_dump() { :; }
+add_check() { printf '%s|%s\n' "$1" "$2"; }
+diagnostics > "$ROOT/checks"
+grep -q '^SOCKS 127.0.0.1:1081|1$' "$ROOT/checks"
+grep -q -- '--socks5-hostname 127.0.0.1:1081' "$ROOT/curl-args"
+if grep -q '^Podkop ' "$ROOT/checks"; then exit 8; fi
+`);
+});

@@ -19,6 +19,7 @@ let lastProgressKey = "";
 let testStatusBusy = false;
 let lastTestReport = "";
 let settingsDirty = false;
+let diagnosticsLoaded = false;
 
 function injectStyles() {
 	if (document.getElementById("byedpi-luci-style"))
@@ -235,12 +236,21 @@ function optionLabel(item) {
 }
 
 function renderStrategyOptions(selectedValue) {
-	return sortedStrategies().map(function(item) {
+	const matched = sortedStrategies().some(function(item) { return normalizeStrategy(item.value) === normalizeStrategy(selectedValue); });
+	return [ E("option", { value: "", selected: !matched ? "selected" : null }, _("— своя стратегия —")) ].concat(sortedStrategies().map(function(item) {
 		return E("option", {
 			value: item.value,
-			selected: item.value === selectedValue ? "selected" : null
+			selected: normalizeStrategy(item.value) === normalizeStrategy(selectedValue) ? "selected" : null
 		}, optionLabel(item));
-	});
+	}));
+}
+
+function syncPresetSelection(value) {
+	const select = getPresetSelect();
+	if (select) {
+		const match = sortedStrategies().find(function(item) { return normalizeStrategy(item.value) === normalizeStrategy(value); });
+		select.value = match ? match.value : "";
+	}
 }
 
 function setActiveTab(name) {
@@ -253,6 +263,8 @@ function setActiveTab(name) {
 	document.querySelectorAll(".byedpi-tab").forEach(function(tab) {
 		tab.classList.toggle("active", tab.dataset.tab === name);
 	});
+	if (name === "diagnostics" && !diagnosticsLoaded)
+		refreshDiagnostics();
 }
 
 function renderStatus(data) {
@@ -268,7 +280,8 @@ function renderStatus(data) {
 		E("div", { class: "byedpi-status-line" }, [
 			E("span", { class: "byedpi-badge " + (running ? "ok" : "bad") }, running ? _("Запущен") : _("Остановлен")),
 			data.pid ? E("span", {}, "PID: " + data.pid) : "",
-			data.enabled ? E("span", { class: "byedpi-badge ok" }, _("Автозапуск включен")) : E("span", { class: "byedpi-badge warn" }, _("Автозапуск выключен"))
+			data.enabled ? E("span", { class: "byedpi-badge ok" }, _("Автозапуск включен")) : E("span", { class: "byedpi-badge warn" }, _("Автозапуск выключен")),
+			data.config_enabled === false ? E("span", { class: "byedpi-badge warn" }, _("Секция ByeDPI выключена")) : ""
 		]),
 		E("pre", { class: "byedpi-command" }, command || _("Команда запуска недоступна"))
 	]));
@@ -281,11 +294,13 @@ function updateStatus() {
 		const strategy = getStrategyTextarea();
 		const enabled = getEnabledInput();
 
-		if (strategy && !settingsDirty && document.activeElement !== strategy)
+		if (strategy && !settingsDirty && document.activeElement !== strategy) {
 			strategy.value = data.current_strategy || "";
+			syncPresetSelection(strategy.value);
+		}
 
 		if (enabled && !settingsDirty)
-			enabled.checked = !!data.enabled;
+			enabled.checked = !!data.enabled && data.config_enabled !== false;
 	}).catch(function(err) {
 		const node = document.getElementById(STATUS_NODE_ID);
 		if (node)
@@ -325,7 +340,10 @@ function refreshDiagnostics() {
 	if (node)
 		node.replaceChildren(E("div", { class: "byedpi-muted" }, _("Проверяю...")));
 
-	return execJson([ "diagnostics" ], 20000).then(renderDiagnostics).catch(function(err) {
+	return execJson([ "diagnostics" ], 20000).then(function(data) {
+		diagnosticsLoaded = true;
+		renderDiagnostics(data);
+	}).catch(function(err) {
 		if (node)
 			node.replaceChildren(E("div", { class: "alert-message warning" }, err.message || err));
 	});
@@ -423,7 +441,7 @@ function renderTestProgress(status) {
 					const strategy = getStrategyTextarea();
 					if (strategy) strategy.value = item.strategy;
 					settingsDirty = true;
-					getPresetSelect().value = item.strategy;
+					syncPresetSelection(item.strategy);
 					setActiveTab("settings");
 					strategy.focus();
 				}
@@ -481,10 +499,14 @@ function saveAndRestart(strategy, enabled) {
 		return Promise.resolve();
 	}
 
-	return execJson([ "apply", strategy, enabled ? "1" : "0" ], 30000).then(function(data) {
+	const preset = getPresetSelect();
+	const fromPreset = preset && preset.value && normalizeStrategy(preset.value) === strategy;
+	return execJson([ "apply", strategy, enabled ? "1" : "0", fromPreset ? "1" : "0" ], 30000).then(function(data) {
 		settingsDirty = false;
 		notify(_("Настройки сохранены"), "info");
 		renderStatus(data);
+		const input = getStrategyTextarea();
+		if (input) { input.value = data.current_strategy || ""; syncPresetSelection(input.value); }
 	}).catch(function(err) {
 		notify(err.message || err, "error");
 	});
@@ -514,7 +536,10 @@ function bindHandlers() {
 			settingsDirty = true;
 		});
 
-	getStrategyTextarea().addEventListener("input", function() { settingsDirty = true; });
+	getStrategyTextarea().addEventListener("input", function() {
+		settingsDirty = true;
+		syncPresetSelection(this.value);
+	});
 	getEnabledInput().addEventListener("change", function() { settingsDirty = true; });
 
 	const saveButton = document.getElementById("byedpi-save-restart");
@@ -546,7 +571,7 @@ function renderSettings(status) {
 			E("div", { class: "byedpi-panel" }, [
 				E("h3", {}, _("Стратегия")),
 				E("label", { class: "byedpi-inline" }, [
-					E("input", { id: "byedpi-enabled", type: "checkbox", checked: status.enabled ? "checked" : null }),
+					E("input", { id: "byedpi-enabled", type: "checkbox", checked: status.enabled && status.config_enabled !== false ? "checked" : null }),
 					_("Включить ByeDPI")
 				]),
 				E("div", { class: "byedpi-row" }, [
@@ -587,7 +612,7 @@ function renderTesterTab() {
 	return E("div", { class: "byedpi-tab", "data-tab": "tester" }, [
 		E("div", { class: "byedpi-panel" }, [
 			E("h3", {}, _("Подбор стабильной стратегии")),
-			E("p", {}, _("Сначала проверяются все стратегии и текущая настройка. Затем до трёх лучших кандидатов проходят повторные проверки по очереди. Рабочий ByeDPI продолжает работать.")),
+			E("p", {}, _("Сначала проверяются все стратегии и текущая настройка (при плохом канале до примерно 10 минут). Затем до трёх лучших кандидатов проходят повторные проверки по очереди. Рабочий ByeDPI продолжает работать.")),
 			E("p", { class: "byedpi-muted" }, _("Рейтинг строится на этом роутере через его провайдера. Результаты других роутеров не используются.")),
 			E("label", { class: "byedpi-inline" }, [ _("Повторная проверка после отбора: "),
 				E("select", { id: "byedpi-test-duration" }, [
@@ -624,7 +649,6 @@ return view.extend({
 		return Promise.all([
 			execJson([ "list-strategies" ], 15000),
 			execJson([ "status" ], 10000),
-			execJson([ "diagnostics" ], 20000).catch(function() { return { checks: [] }; }),
 			execJson([ "test-status" ], 10000).catch(function() { return { active: false }; })
 		]);
 	},
@@ -634,10 +658,9 @@ return view.extend({
 
 		strategies = Array.isArray(data[0].strategies) ? data[0].strategies : [];
 		const status = data[1] || {};
-		const diagnostics = data[2] || { checks: [] };
 
 		const page = E("div", { class: "byedpi-page" }, [
-			E("h2", {}, [ _("Настройки ByeDPI"), E("small", { class: "byedpi-muted", style: "margin-left:12px;font-size:13px" }, "0.2.1") ]),
+			E("h2", {}, [ _("Настройки ByeDPI"), E("small", { class: "byedpi-muted", style: "margin-left:12px;font-size:13px" }, "0.2.2") ]),
 			E("div", { class: "byedpi-tabs" }, [
 				E("button", { class: "btn cbi-button active", "data-tab": "settings" }, _("Настройки")),
 				E("button", { class: "btn cbi-button", "data-tab": "diagnostics" }, _("Диагностика")),
@@ -651,8 +674,7 @@ return view.extend({
 		window.setTimeout(function() {
 			bindHandlers();
 			renderStatus(status);
-			renderDiagnostics(diagnostics);
-			renderTestProgress(data[3]);
+			renderTestProgress(data[2]);
 			setActiveTab(activeTab);
 			poll.add(updateStatus);
 			poll.add(refreshTestStatus, 3);
